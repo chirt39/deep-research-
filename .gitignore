@@ -31,3 +31,4 @@ Thumbs.db
 
 # Database
 *.db
+config.json

@@ -2,10 +2,10 @@ import asyncio
 from threading import Lock, Thread
 from typing import AsyncIterator, Callable
 
-from mult_agents.config import AppConfig
-from mult_agents.graph import build_app as build_workflow_app
-from mult_agents.main import build_agents, build_checkpointer, build_memory_manager
-from mult_agents.state import create_initial_state
+from ...mult_agents.config import AppConfig
+from ...mult_agents.graph import build_app as build_workflow_app
+from ...mult_agents.main import build_agents, build_checkpointer, build_memory_manager
+from ...mult_agents.state import create_initial_state
 
 
 class WorkflowService:
@@ -25,7 +25,7 @@ class WorkflowService:
                 return
             base_config = AppConfig.from_file(self._config_path)
             self._memory_manager = build_memory_manager(base_config)
-            agents = build_agents(base_config.model, base_config.api_key, base_config)
+            agents = build_agents(base_config.model, base_config.api_key, base_config.base_url, base_config)
             checkpointer = build_checkpointer(base_config)
             self._app = build_workflow_app(agents, checkpointer)
             self._base_config = base_config

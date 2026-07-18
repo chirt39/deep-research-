@@ -1,6 +1,6 @@
 from functools import lru_cache
 
-from backend.config import AppSettings
+from ..config import AppSettings
 from .workflow_service import WorkflowService
 
 

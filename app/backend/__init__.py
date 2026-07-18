@@ -1,3 +1,3 @@
-from backend.config import AppSettings
+from .config import AppSettings
 
 __all__ = ["AppSettings"]

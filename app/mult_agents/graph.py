@@ -58,7 +58,7 @@ def build_app(agents, checkpointer):
     workflow.add_node("local_rag", bind_agent(local_rag_node, agents.scout_local, "scout_local"))
     workflow.add_node("deep_dive", bind_agent(deep_dive_node, agents.evidence_judge, "evidence_judge"))
     workflow.add_node("analyze", bind_agent(analyze_node, agents.analyst, "analyst"))
-    workflow.add_node("reflect", bind_agent(reflect_node, agents.planner, "planner"))
+    workflow.add_node("reflect", bind_agent(reflect_node, agents.reflect_planner, "reflect_planner"))
     workflow.add_node("write", bind_agent(write_node, agents.writer, "writer"))
     
     workflow.add_edge(START, "intent")

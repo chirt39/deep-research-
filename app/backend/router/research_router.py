@@ -3,8 +3,8 @@ import json
 from fastapi import APIRouter, Depends
 from fastapi.responses import StreamingResponse
 
-from backend.schemas import ResearchRequest, ResearchResponse
-from backend.service import WorkflowService, get_workflow_service
+from ..schemas import ResearchRequest, ResearchResponse
+from ..service import WorkflowService, get_workflow_service
 
 
 router = APIRouter(prefix="/api/v1/research", tags=["research"])

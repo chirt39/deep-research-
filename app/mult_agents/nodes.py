@@ -9,7 +9,7 @@ from functools import partial
 from langchain_core.messages import HumanMessage
 
 from .state import ResearchState
-from .tools import bocha_web_search_records, search_knowledge_base_records
+from .tools import bocha_web_search_records, search_knowledge_base_records, collect_finance_data_records
 
 
 logger = logging.getLogger("mult_agents")
@@ -382,11 +382,29 @@ def _filter_local_records(query: str, records: list[dict]) -> tuple[list[dict], 
     return kept, stats
 
 
+def _trim_evidence_for_llm(evidence: list[dict]) -> list[dict]:
+    """压缩证据记录，只保留 LLM 需要的关键字段，减少 prompt token。"""
+    trimmed = []
+    for item in (evidence or []):
+        if not isinstance(item, dict):
+            continue
+        trimmed.append({
+            "source_id": item.get("source_id", ""),
+            "title": str(item.get("title", ""))[:80],
+            "snippet": str(item.get("snippet", ""))[:150],
+            "url": item.get("url", ""),
+            "domain": item.get("domain", ""),
+            "reliability_hint": item.get("reliability_hint", ""),
+            "source_type": item.get("source_type", ""),
+        })
+    return trimmed
+
+
 def _format_raw_records(records: list[dict], source_type: str) -> str:
     if not records:
         return "[]"
     lines = []
-    for record in records[:40]:
+    for record in records[:30]:  # 限制 30 条，减少 prompt token
         locator = record.get("url") or record.get("doc_id") or ""
         lines.append(
             json.dumps(
@@ -395,7 +413,7 @@ def _format_raw_records(records: list[dict], source_type: str) -> str:
                     "title": record.get("title"),
                     "url": record.get("url", ""),
                     "doc_id": record.get("doc_id", ""),
-                    "snippet": str(record.get("snippet", ""))[:500],
+                    "snippet": str(record.get("snippet", ""))[:200],  # 截断到 200 字
                     "source_type": source_type,
                 },
                 ensure_ascii=False,
@@ -594,81 +612,12 @@ def _fallback_audit(state: ResearchState) -> dict:
                     "source_type": record.get("source_type", "source"),
                 }
             )
-    for hypo in state.get("hypotheses", []):
-        hypo_id = hypo.get("id")
-        related = [item for item in evidence_pool if hypo_id in item.get("supports", []) or hypo_id in item.get("refutes", [])]
-        if not related:
-            audit_flags.append({"type": "missing_evidence", "target": hypo_id, "reason": "缺少直接关联证据"})
     return {
         "summary": "完成证据评分与审计。",
         "evidence_pool": evidence_pool,
         "audit_flags": audit_flags,
         "source_index": _dedupe_sources(source_index, ["source_id"]),
     }
-
-
-def _fallback_analysis(state: ResearchState) -> dict:
-    source_ids = [item.get("source_id") for item in state.get("evidence_pool", [])[:3] if item.get("source_id")]
-    findings = [
-        {
-            "claim_id": "c_1",
-            "claim": f"围绕“{state['query']}”已完成多源检索，初步证据表明问题可以从网络与本地知识库双侧支撑。",
-            "confidence": "medium" if source_ids else "low",
-            "source_ids": source_ids,
-        }
-    ]
-    hypothesis_status = []
-    for hypo in state.get("hypotheses", []):
-        hypothesis_status.append(
-            {
-                "id": hypo.get("id"),
-                "status": "verified" if source_ids else "uncertain",
-                "reason": "已有可用证据池" if source_ids else "证据不足",
-                "source_ids": source_ids,
-            }
-        )
-    return {
-        "analysis_summary": "完成结论归纳与假设状态整理。",
-        "hypothesis_status": hypothesis_status,
-        "findings": findings,
-        "claim_map": [{"claim_id": item["claim_id"], "source_ids": item["source_ids"]} for item in findings],
-        "next_actions": [] if source_ids else ["补充更多高质量来源"],
-    }
-
-
-def _render_fallback_report(state: ResearchState) -> str:
-    lines = ["# 调研结果", "", "## 执行摘要", state.get("analysis", "暂无分析结果"), ""]
-    lines.append("## 任务规划与假设状态")
-    for hypo in state.get("hypotheses", []):
-        status = hypo.get("status", "unverified")
-        lines.append(f"- {hypo.get('id', 'h')}: {hypo.get('content', '')} | 状态: {status}")
-    lines.append("")
-    lines.append("## 核心结论")
-    for finding in state.get("findings", []):
-        refs = "".join(f"[{source_id}]" for source_id in finding.get("source_ids", []))
-        lines.append(f"- {finding.get('claim', '')} {refs}".rstrip())
-    lines.append("")
-    lines.append("## 风险与不确定性")
-    if state.get("audit_flags"):
-        for flag in state["audit_flags"]:
-            lines.append(f"- {flag.get('type')}: {flag.get('reason')} ({flag.get('target')})")
-    else:
-        lines.append("- 当前未发现明显冲突。")
-    lines.append("")
-    lines.append("## 检索统计")
-    web_stats = state.get("web_retrieval_stats", {})
-    local_stats = state.get("local_retrieval_stats", {})
-    if web_stats or local_stats:
-        lines.append(f"- 网络检索：queries={web_stats.get('query_count', 0)} raw={web_stats.get('raw_count', 0)} kept={web_stats.get('kept_count', 0)} dropped={web_stats.get('dropped_count', 0)}")
-        lines.append(f"- 本地检索：queries={local_stats.get('query_count', 0)} raw={local_stats.get('raw_count', 0)} kept={local_stats.get('kept_count', 0)} dropped={local_stats.get('dropped_count', 0)}")
-    else:
-        lines.append("- 未记录检索统计。")
-    lines.append("")
-    lines.append("## 引用列表")
-    for source in state.get("source_index", []):
-        source_type = source.get("source_type", "source")
-        lines.append(f"- {source.get('source_id')} [{source_type}]: {source.get('label')} | {source.get('locator')}")
-    return "\n".join(lines)
 
 
 def _build_source_lookup(state: ResearchState) -> dict[str, dict]:
@@ -826,111 +775,6 @@ def _render_reference_list(state: ResearchState) -> str:
     return "\n".join(lines)
 
 
-def _render_execution_appendix(state: ResearchState) -> str:
-    lines = ["## 规划与检索明细", "", "### 执行概览"]
-    search_plan = state.get("search_plan", [])
-    web_stats = state.get("web_retrieval_stats", {})
-    local_stats = state.get("local_retrieval_stats", {})
-    lines.append(f"- 规划生成研究问题数: {len(state.get('research_questions', []))}")
-    lines.append(f"- 规划生成搜索步骤数: {len(search_plan)}")
-    
-    iteration = state.get("iteration", 0)
-    lines.append(f"- 经过 {iteration + 1} 轮检索迭代")
-    if state.get("needs_more_research"):
-        lines.append(f"- 信息缺口: {state.get('missing_gaps', [])}")
-        
-    lines.append(
-        f"- 实际执行网页检索问题数: {web_stats.get('query_count', 0)} | 原始命中: {web_stats.get('raw_count', 0)} | 保留证据: {web_stats.get('kept_count', 0)} | 丢弃: {web_stats.get('dropped_count', 0)}"
-    )
-    lines.append(
-        f"- 实际执行本地检索问题数: {local_stats.get('query_count', 0)} | 原始命中: {local_stats.get('raw_count', 0)} | 保留证据: {local_stats.get('kept_count', 0)} | 丢弃: {local_stats.get('dropped_count', 0)}"
-    )
-    lines.append("")
-    lines.append("### 问题拆解明细")
-    for sq in state.get("sub_questions", []):
-        lines.append(f"- {sq}")
-    if not state.get("sub_questions"):
-        lines.append("- 无")
-    lines.append("")
-    lines.append("### 规划输出")
-    outline = state.get("outline", [])
-    if outline:
-        for section in outline:
-            lines.append(
-                f"- {section.get('id')}: {section.get('title')} | {section.get('description')} | search_queries={section.get('search_queries', [])}"
-            )
-    else:
-        lines.append("- 无")
-    lines.append("")
-    lines.append("### 研究问题")
-    for index, question in enumerate(state.get("research_questions", []), 1):
-        lines.append(f"- Q{index}: {question}")
-    if not state.get("research_questions"):
-        lines.append("- 无")
-    lines.append("")
-    lines.append("### 搜索计划")
-    for index, item in enumerate(state.get("search_plan", []), 1):
-        lines.append(
-            f"- S{index}: section={item.get('section_id')} | query={item.get('query')} | source={item.get('source_preference')} | reason={item.get('reason')}"
-        )
-    if not state.get("search_plan"):
-        lines.append("- 无")
-    lines.append("")
-    if state.get("supplementary_queries"):
-        lines.append("### 补搜计划")
-        for index, item in enumerate(state.get("supplementary_queries", []), 1):
-            lines.append(f"- S{index} (补搜): query={item.get('query')} | reason={item.get('reason')}")
-        lines.append("")
-    lines.append("### 网页检索明细")
-    for index, trace in enumerate(state.get("web_search_trace", []), 1):
-        lines.append(
-            f"- WQ{index}: section={trace.get('section_id')} | query={trace.get('query')} | reason={trace.get('reason')} | raw={trace.get('raw_count', 0)} | kept={trace.get('kept_count', 0)} | rejected={trace.get('rejected_count', 0)}"
-        )
-        lines.append(f"  - raw_ids={trace.get('raw_source_ids', [])}")
-        lines.append(f"  - kept_ids={trace.get('kept_source_ids', [])}")
-        lines.append(f"  - rejected_ids={trace.get('rejected_source_ids', [])}")
-        if trace.get("reject_reason"):
-            lines.append(f"  - reject_reason={trace.get('reject_reason')}")
-        lines.append("  - raw_samples:")
-        for item in trace.get("raw_records", [])[:3]:
-            lines.append(f"    - {item.get('source_id')}: {item.get('title')} | {item.get('locator')}")
-        if trace.get("kept_records"):
-            lines.append("  - kept_samples:")
-            for item in trace.get("kept_records", [])[:3]:
-                lines.append(f"    - {item.get('source_id')}: {item.get('title')} | {item.get('locator')}")
-        if trace.get("rejected_records"):
-            lines.append("  - rejected_samples:")
-            for item in trace.get("rejected_records", [])[:3]:
-                lines.append(f"    - {item.get('source_id')}: {item.get('title')} | {item.get('locator')}")
-    if not state.get("web_search_trace"):
-        lines.append("- 无")
-    lines.append("")
-    lines.append("### 本地检索明细")
-    for index, trace in enumerate(state.get("local_rag_trace", []), 1):
-        lines.append(
-            f"- LQ{index}: section={trace.get('section_id')} | query={trace.get('query')} | reason={trace.get('reason')} | raw={trace.get('raw_count', 0)} | kept={trace.get('kept_count', 0)} | rejected={trace.get('rejected_count', 0)}"
-        )
-        lines.append(f"  - raw_ids={trace.get('raw_source_ids', [])}")
-        lines.append(f"  - kept_ids={trace.get('kept_source_ids', [])}")
-        lines.append(f"  - rejected_ids={trace.get('rejected_source_ids', [])}")
-        if trace.get("reject_reason"):
-            lines.append(f"  - reject_reason={trace.get('reject_reason')}")
-        lines.append("  - raw_samples:")
-        for item in trace.get("raw_records", [])[:3]:
-            lines.append(f"    - {item.get('source_id')}: {item.get('title')} | {item.get('locator')}")
-        if trace.get("kept_records"):
-            lines.append("  - kept_samples:")
-            for item in trace.get("kept_records", [])[:3]:
-                lines.append(f"    - {item.get('source_id')}: {item.get('title')} | {item.get('locator')}")
-        if trace.get("rejected_records"):
-            lines.append("  - rejected_samples:")
-            for item in trace.get("rejected_records", [])[:3]:
-                lines.append(f"    - {item.get('source_id')}: {item.get('title')} | {item.get('locator')}")
-    if not state.get("local_rag_trace"):
-        lines.append("- 无")
-    return "\n".join(lines)
-
-
 def _ensure_reference_section(content: str, state: ResearchState) -> str:
     base = content.rstrip()
     references = _render_reference_list(state)
@@ -942,6 +786,13 @@ def _ensure_reference_section(content: str, state: ResearchState) -> str:
 def intent_node(state: ResearchState, agent, agent_name: str) -> ResearchState:
     logger.info("%s 开始 | agent=%s", colorize("[intent]", "cyan"), colorize(agent_name, "magenta"))
     rule_route = detect_intent(state["query"])
+
+    # 规则引擎已明确判断为多智能体 → 跳过 LLM 调用，节省 2-5 秒
+    if rule_route == "multiagent":
+        logger.info("%s 路由 (规则直判): %s", colorize("[intent]", "green"), rule_route)
+        return {"intent": "multiagent", "draft": "", "messages": []}
+
+    # 只有规则判定为 direct 时才用 LLM 二次确认（避免误判简单问题）
     prompt = (
         f"用户问题：{state['query']}\n"
         f"规则引擎初判：{rule_route}\n"
@@ -1048,18 +899,41 @@ def web_search_node(state: ResearchState, agent, agent_name: str) -> ResearchSta
         )
     raw_records = _dedupe_sources(raw_records, ["url", "title"])
     raw_records = _minimal_record_filter(raw_records, ["title", "snippet", "url"])
+
+    # ── 注入 AKShare 金融数据 ──
+    finance_records = collect_finance_data_records(state["query"])
+    if finance_records and "error" not in (finance_records[0] if finance_records else {}):
+        logger.info("[web_search_node] 金融数据采集 | 记录数=%s", len(finance_records))
+        # 为金融数据记录补充 source_id 前缀（避免与 Bocha 冲突）
+        for idx, record in enumerate(finance_records, 1):
+            if not record.get("source_id"):
+                record["source_id"] = f"FIN-AUTO-{idx}"
+        raw_records.extend(finance_records)
+        query_traces.append({
+            "iteration": iteration,
+            "plan_step": "finance_data",
+            "query": f"金融数据采集: {state['query'][:80]}",
+            "section_id": "finance_data",
+            "reason": "自动采集股票代码关联的行情/财务/新闻数据",
+            "source_preference": "finance_data",
+            "raw_count": len(finance_records),
+            "raw_records": _summarize_records(finance_records),
+        })
+    elif finance_records and "error" in (finance_records[0] if finance_records else {}):
+        logger.info("[web_search_node] 金融数据采集失败: %s", finance_records[0].get("error"))
+
     logger.info("[web_search_node] 数据清洗后 | 去重过滤后记录数=%s", len(raw_records))
-    
+
     web_retrieval_stats = state.get("web_retrieval_stats", {})
     web_retrieval_stats["query_count"] = web_retrieval_stats.get("query_count", 0) + len(queries)
     web_retrieval_stats["raw_count"] = web_retrieval_stats.get("raw_count", 0) + len(raw_records)
-    
+
     log_inputs("web_search", agent_name, {"query_count": str(len(queries)), "raw_count": str(len(raw_records))})
     if not raw_records:
-        logger.warning("[web_search_node] 无可用网页证据，跳过网页上下文注入 | 查询数=%s", len(queries))
-        logger.info("%s 无可用网页证据，跳过网页上下文注入", colorize("[web_search]", "yellow"))
+        logger.warning("[web_search_node] 无可用证据，跳过网页上下文注入 | 查询数=%s", len(queries))
+        logger.info("%s 无可用证据，跳过网页上下文注入", colorize("[web_search]", "yellow"))
         return {
-            "web_search": "未检索到可用网页证据，已跳过网页上下文注入。",
+            "web_search": "未检索到可用网页/金融数据证据，已跳过网页上下文注入。",
             "web_evidence": state.get("web_evidence", []),
             "web_retrieval_stats": web_retrieval_stats,
             "web_search_trace": query_traces,
@@ -1077,8 +951,13 @@ def web_search_node(state: ResearchState, agent, agent_name: str) -> ResearchSta
         "web_search",
         fallback,
     )
-    evidence = payload.get("evidence") if isinstance(payload.get("evidence"), list) else fallback["evidence"]
-    logger.info("[web_search_node] LLM 返回证据 | evidence数量=%s", len(evidence))
+    evidence = (
+        payload.get("evidence")
+        if isinstance(payload.get("evidence"), list) and len(payload.get("evidence")) > 0
+        else fallback["evidence"]
+    )
+    logger.info("[web_search_node] LLM 返回证据 | evidence数量=%s | 来源=%s",
+                len(evidence), "LLM" if isinstance(payload.get("evidence"), list) and len(payload.get("evidence")) > 0 else "fallback")
     allowed_source_ids = {str(item.get("source_id")) for item in raw_records if item.get("source_id")}
     evidence = _prune_evidence_to_allowed_sources(evidence, allowed_source_ids)
     # 从原始记录补充 LLM 可能丢失的 url/domain/title 字段
@@ -1162,7 +1041,11 @@ def local_rag_node(state: ResearchState, agent, agent_name: str) -> ResearchStat
         "local_rag",
         fallback,
     )
-    evidence = payload.get("evidence") if isinstance(payload.get("evidence"), list) else fallback["evidence"]
+    evidence = (
+        payload.get("evidence")
+        if isinstance(payload.get("evidence"), list) and len(payload.get("evidence")) > 0
+        else fallback["evidence"]
+    )
     allowed_source_ids = {str(item.get("source_id")) for item in raw_records if item.get("source_id")}
     evidence = _prune_evidence_to_allowed_sources(evidence, allowed_source_ids)
     
@@ -1198,8 +1081,8 @@ def deep_dive_node(state: ResearchState, agent, agent_name: str) -> ResearchStat
         "请对 web 与 local 证据进行评分、去重、冲突审计，并只输出 JSON。\n"
         f"问题：{state['query']}\n"
         f"子问题：{json.dumps(state.get('sub_questions', []), ensure_ascii=False)}\n"
-        f"web_evidence：{json.dumps(state.get('web_evidence', []), ensure_ascii=False)}\n"
-        f"local_evidence：{json.dumps(state.get('local_evidence', []), ensure_ascii=False)}",
+        f"web_evidence：{json.dumps(_trim_evidence_for_llm(state.get('web_evidence', [])), ensure_ascii=False)}\n"
+        f"local_evidence：{json.dumps(_trim_evidence_for_llm(state.get('local_evidence', [])), ensure_ascii=False)}",
         agent,
         agent_name,
         "deep_dive",
@@ -1283,7 +1166,7 @@ def analyze_node(state: ResearchState, agent, agent_name: str) -> ResearchState:
         "请基于证据池输出结论映射 JSON，并评估证据完备性：\n"
         f"原问题：{state['query']}\n"
         f"子问题：{json.dumps(state.get('sub_questions', []), ensure_ascii=False)}\n"
-        f"证据池：{json.dumps(state.get('evidence_pool', []), ensure_ascii=False)}\n"
+        f"证据池：{json.dumps(_trim_evidence_for_llm(state.get('evidence_pool', [])), ensure_ascii=False)}\n"
         f"审计标记：{json.dumps(state.get('audit_flags', []), ensure_ascii=False)}",
         agent,
         agent_name,

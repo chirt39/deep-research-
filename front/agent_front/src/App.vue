@@ -25,48 +25,50 @@ const composerRef = ref<HTMLTextAreaElement | null>(null)
 const progressLogs = ref<string[]>([])
 const starterPrompts = [
   {
-    title: '深度调研',
+    title: '个股深度研究',
     prompt:
-      '请调研“企业知识库 Agent 平台”市场，按市场规模、主要竞品、收费模式三部分输出，并在每部分附上可追溯来源链接。',
+      '请深度研究比亚迪（002594），包括行业竞争格局、近三年财务健康度、当前估值水平（PE/PB vs 同业）、机构评级变化和主要风险因素，输出完整的投资研报。',
   },
   {
-    title: '方案对比',
+    title: '行业赛道分析',
     prompt:
-      '我们要做多 Agent 研究助手，请对比“纯大模型直答”“RAG 单 Agent”“多 Agent 协作”三种方案，给出优缺点、适用场景与推荐结论。',
+      '请分析2026年新能源汽车行业的投资机会：市场规模与增速、产业链利润分布、主要玩家竞争壁垒、政策催化方向，以及推荐关注的标的。',
   },
   {
-    title: '知识问答',
-    prompt: '请解释这个项目里“意图分流”的作用，以及简单问题和复杂问题分别会走哪条链路。',
+    title: '宏观策略研判',
+    prompt:
+      '当前国内货币政策处于什么周期？结合CPI/PMI/M2/社融数据，分析对A股市场整体估值的影响，并给出下半年大类资产配置建议。',
   },
   {
-    title: '落地计划',
-    prompt: '请把“上线一个可用的 DeepResearch MVP”拆成两周计划，按每天输出任务、验收标准和风险点。',
+    title: '估值对比分析',
+    prompt:
+      '请对比宁德时代和比亚迪的估值水平：PE/PB/PS/PEG 横向对比 vs 近3年历史分位，DCF 核心假设差异，并给出哪个当前更具性价比的结论。',
   },
 ]
 const capabilityHighlights = [
   {
-    title: '多智能体编排',
-    desc: '自动完成规划、检索、证据裁判、分析与写作，减少手工研究路径。',
+    title: '五维分析框架',
+    desc: '宏观→行业→公司→估值→舆情，五层递进，每个结论绑定可追溯来源。',
   },
   {
-    title: '双源检索融合',
-    desc: '网络信息与本地知识库并行召回，输出结论同时保留来源可追溯性。',
+    title: '金融信源分层',
+    desc: '官方公告>持牌机构研报>头部财经媒体>数据平台>自媒体，自动打分去重。',
   },
   {
-    title: '会话记忆增强',
-    desc: '跨轮次继承用户偏好与历史任务，持续提升回答一致性和效率。',
+    title: '多维估值模型',
+    desc: '相对估值（PE/PB/PS/PEG）+ 绝对估值（DCF），同业对比与历史分位交叉验证。',
   },
 ]
 const landingMetrics = [
-  { label: '执行模式', value: 'Quick + Deep' },
-  { label: '检索来源', value: 'Web + Local' },
-  { label: '输出风格', value: '结论 + 证据' },
+  { label: '分析维度', value: '宏观·行业·公司·估值·舆情' },
+  { label: '证据来源', value: 'Web + 金融API + 知识库' },
+  { label: '输出标准', value: '专业投研报告' },
 ]
 const messages = ref<ChatMessage[]>([
   {
     id: `m-${Date.now()}`,
     role: 'assistant',
-    content: '你好，我是 DeepResearch。你可以直接提问，我会根据意图自动走快速回答或完整研究链路。',
+      content: '你好，我是 DeepResearch 金融投研助手。输入股票代码或研究问题，我会自动执行宏观研判→行业分析→公司深度→估值模型→舆情跟踪的全链路分析，输出专业投研报告。',
   },
 ])
 
@@ -151,7 +153,7 @@ const createNewChat = () => {
     {
       id: `m-${Date.now()}`,
       role: 'assistant',
-      content: '已开始新会话。你可以继续提问。',
+      content: '已开始新会话。输入股票代码或研究问题即可开始分析。',
     },
   ]
   progressLogs.value = []
@@ -271,9 +273,9 @@ const runResearch = async () => {
   <div class="chat-shell">
     <aside class="chat-sidebar">
       <div class="sidebar-brand">
-        <p class="brand-badge">AI Copilot</p>
+        <p class="brand-badge">FinResearch</p>
         <h1>DeepResearch</h1>
-        <p class="brand-desc">多智能体研究工作台，支持快速回答与深度调研。</p>
+        <p class="brand-desc">金融多智能体深度投研平台，覆盖宏观·行业·公司·估值·舆情五维分析。</p>
       </div>
       <div class="sidebar-head">
         <button class="new-chat-btn" @click="createNewChat">新建会话</button>
@@ -307,26 +309,26 @@ const runResearch = async () => {
     <main class="chat-main">
       <header class="main-header">
         <div>
-          <h2>DeepResearch Enterprise Workspace</h2>
-          <p>面向业务团队的企业级智能研究台，支持从问题定义到结论落地的完整链路。</p>
+          <h2>DeepResearch 金融投研工作台</h2>
+          <p>面向投资研究团队的专业级智能分析平台，从问题定义到专业研报输出的全链路自动化。</p>
         </div>
         <div class="header-tags">
-          <span>Evidence-Driven</span>
-          <span>Structured Output</span>
-          <span>Memory-Powered</span>
+          <span>五维分析框架</span>
+          <span>信源交叉验证</span>
+          <span>券商级研报</span>
         </div>
       </header>
       <div ref="messageListRef" class="message-list">
         <section v-if="messages.length <= 1" class="onboarding-panel">
           <div class="hero-panel">
-            <p class="hero-badge">商业研究 · 策略分析 · 知识问答</p>
-            <h3>第一步先讲清目标，再交给 DeepResearch 自动推进</h3>
+            <p class="hero-badge">宏观研判 · 行业分析 · 公司深度 · 估值模型 · 舆情跟踪</p>
+            <h3>输入股票代码或研究问题，自动生成专业投研报告</h3>
             <p class="hero-desc">
-              推荐提问结构：目标 + 背景约束 + 期望输出。系统会自动选择快速回答或深度研究链路。
+              推荐提问结构：标的 + 分析维度 + 时间范围。系统自动执行宏观/行业/公司/估值/舆情五维分析。
             </p>
             <div class="hero-actions">
-              <button class="hero-btn primary" @click="applyStarterByIndex(0)">快速开始调研</button>
-              <button class="hero-btn" @click="applyStarterByIndex(1)">查看方案对比</button>
+              <button class="hero-btn primary" @click="applyStarterByIndex(0)">个股深度研究</button>
+              <button class="hero-btn" @click="applyStarterByIndex(1)">行业赛道分析</button>
             </div>
             <div class="metric-grid">
               <article v-for="item in landingMetrics" :key="item.label">
@@ -343,18 +345,18 @@ const runResearch = async () => {
           </div>
           <div class="guide-panel">
             <h4>提问指南</h4>
-            <div class="guide-grid">
+            <div class=”guide-grid”>
               <article>
-                <h5>1. 说明目标</h5>
-                <p>你要解决什么问题、面向谁、希望达到什么结果。</p>
+                <h5>1. 指定标的</h5>
+                <p>输入股票代码或公司名称，例如「002594 比亚迪」或「宁德时代」。</p>
               </article>
               <article>
-                <h5>2. 提供上下文</h5>
-                <p>给出已知信息、时间范围、数据口径、业务限制。</p>
+                <h5>2. 明确维度</h5>
+                <p>选择关注的分析维度：财务健康度 / 估值水平 / 行业竞争 / 宏观影响 / 机构评级。</p>
               </article>
               <article>
-                <h5>3. 指定输出</h5>
-                <p>例如“表格输出”“附来源链接”“分点行动清单”。</p>
+                <h5>3. 限定范围</h5>
+                <p>给出时间跨度和比较基准，例如「近三年财务数据」「与宁德时代对比」。</p>
               </article>
             </div>
           </div>

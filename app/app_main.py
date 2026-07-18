@@ -1,16 +1,11 @@
-"""
- * 小滴课堂,愿景：让技术不再难学
- * @Remark 有问题联系我【xdclass68】
- * 源码-笔记-技术交流群,官网 https://xdclass.net
-"""
 import logging
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 import uvicorn
 
-from backend.config import AppSettings
-from backend.router import health_router, research_router
+from .backend.config import AppSettings
+from .backend.router import health_router, research_router
 
 
 logging.basicConfig(

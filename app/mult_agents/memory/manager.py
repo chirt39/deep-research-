@@ -1,8 +1,4 @@
-"""
-记忆管理器
-
-统一管理短期记忆和长期记忆，提供统一的接口
-"""
+"""记忆管理器 — DeepSeek 版"""
 
 import json
 import logging
@@ -10,8 +6,6 @@ from datetime import datetime
 from typing import Any, Dict, List, Optional
 from uuid import uuid4
 
-from langchain_community.chat_models import ChatTongyi
-from langchain_community.embeddings import DashScopeEmbeddings
 from langchain_core.documents import Document
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage
 
@@ -59,8 +53,12 @@ class MemoryManager:
         milvus_port: int = 19530,
         milvus_collection: str = "mult_agent_memory",
         embedding_api_key: Optional[str] = None,
-        embedding_model: str = "text-embedding-v1",
-        summary_model: str = "qwen-plus",
+        embedding_model: str = "BAAI/bge-small-zh-v1.5",
+        embedding_provider: str = "huggingface",
+        embedding_base_url: str = "",
+        summary_model: str = "deepseek-chat",
+        summary_api_key: str = "",
+        summary_base_url: str = "https://api.deepseek.com/v1",
     ):
         self.default_tenant_id = tenant_id
         self.short_term_backend = short_term_backend.lower()
@@ -87,8 +85,16 @@ class MemoryManager:
             self._init_redis(redis_url)
         self._init_postgres()
         if self.enable_milvus and self.enable_long_term:
-            self._init_milvus(milvus_host, milvus_port, milvus_collection, embedding_api_key, embedding_model)
-        self._init_summary_llm(embedding_api_key, summary_model)
+            self._init_milvus(
+                milvus_host, milvus_port, milvus_collection,
+                embedding_api_key, embedding_model,
+                embedding_provider=embedding_provider,
+                embedding_base_url=embedding_base_url,
+            )
+        self._init_summary_llm(
+            summary_api_key or embedding_api_key, summary_model,
+            summary_base_url=summary_base_url,
+        )
         logger.info(
             "记忆管理器初始化完成 | short_term=%s | long_term=%s | scope=%s | save_task=%s | redis=%s | postgres=%s | milvus=%s",
             self.short_term_backend,
@@ -201,13 +207,18 @@ class MemoryManager:
         milvus_collection: str,
         embedding_api_key: Optional[str],
         embedding_model: str,
+        embedding_provider: str = "huggingface",
+        embedding_base_url: str = "",
     ) -> None:
-        if not milvus_host or not embedding_api_key:
+        if not milvus_host:
             return
         try:
-            embeddings = DashScopeEmbeddings(
+            from mult_agents.llm_factory import build_embeddings
+            embeddings = build_embeddings(
+                provider=embedding_provider,
+                api_key=embedding_api_key or "",
                 model=embedding_model,
-                dashscope_api_key=embedding_api_key,
+                base_url=embedding_base_url,
             )
             self._milvus_store = MilvusVectorStore(
                 embedding_function=embeddings,
@@ -219,11 +230,19 @@ class MemoryManager:
             logger.warning("Milvus 初始化失败，降级 PostgreSQL 检索: %s", exc)
             self._milvus_store = None
 
-    def _init_summary_llm(self, api_key: Optional[str], summary_model: str) -> None:
+    def _init_summary_llm(
+        self, api_key: Optional[str], summary_model: str,
+        summary_base_url: str = "https://api.deepseek.com/v1",
+    ) -> None:
         if not api_key:
             return
         try:
-            self._summary_llm = ChatTongyi(model=summary_model, temperature=0.1, dashscope_api_key=api_key)
+            from mult_agents.llm_factory import build_summary_llm
+            self._summary_llm = build_summary_llm(
+                model=summary_model,
+                api_key=api_key,
+                base_url=summary_base_url,
+            )
         except Exception as exc:
             logger.warning("摘要模型初始化失败，降级规则压缩: %s", exc)
             self._summary_llm = None

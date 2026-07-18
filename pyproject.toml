@@ -1,7 +1,7 @@
 [project]
 name = "mult_agents"
 version = "0.1.0"
-description = "Multi-agent LangGraph pipeline with Qwen"
+description = "DeepResearch — 金融多智能体深度投研平台"
 requires-python = ">=3.10"
 dependencies = [
   "langgraph",
