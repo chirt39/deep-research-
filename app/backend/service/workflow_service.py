@@ -1,6 +1,10 @@
 import asyncio
+import logging
+import time
 from threading import Lock, Thread
 from typing import AsyncIterator, Callable
+
+logger = logging.getLogger("workflow_service")
 
 from ...mult_agents.config import AppConfig
 from ...mult_agents.graph import build_app as build_workflow_app
@@ -84,10 +88,13 @@ class WorkflowService:
             tenant_id=runtime_config.tenant_id,
             memory_context=memory_context,
         )
+        t0 = time.time()
         result = self._app.invoke(
             state,
             {"configurable": {"thread_id": runtime_config.thread_id}},
         )
+        total_elapsed = time.time() - t0
+        logger.info("[workflow] 总耗时: %.1fs | query=%s | iterations=%s", total_elapsed, query[:60], result.get("iteration", "?"))
         final = result.get("final", "")
         route = str(result.get("intent", "multiagent"))
         if self._memory_manager and runtime_config.enable_memory:

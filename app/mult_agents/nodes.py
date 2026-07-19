@@ -4,6 +4,8 @@ import json
 import logging
 import os
 import re
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from functools import partial
 
 from langchain_core.messages import HumanMessage
@@ -164,14 +166,14 @@ def _load_json(text: str, fallback: dict) -> dict:
 
 def _invoke_json_agent(state: ResearchState, prompt: str, agent, agent_name: str, node: str, fallback: dict) -> tuple[dict, str, list]:
     human = HumanMessage(content=with_memory_context(state, prompt))
-    # Optimization: Do NOT pass state["messages"] to avoid token accumulation
-    # Each node only needs its specific instruction and the current state data
+    t0 = time.time()
     result = agent.invoke({"messages": [human]})
+    elapsed = time.time() - t0
+    logger.info("%s LLM耗时: %.1fs | agent=%s", colorize(f"[{node}]", "yellow"), elapsed, agent_name)
     tools, tool_outputs = collect_tool_calls(result["messages"])
     logger.info("%s 工具: %s", colorize(f"[{node}]", "green"), ", ".join(tools) if tools else "无")
     for item in tool_outputs[:5]:
         logger.info("%s 工具输出: %s", colorize(f"[{node}]", "green"), item[:400])
-    logger.info("%s LLM调用: 是 | 思考: 不可见", colorize(f"[{node}]", "yellow"))
     content = _last_content(result)
     emit(node, content)
     return _load_json(content, fallback), content, [human, result["messages"][-1]]
@@ -241,7 +243,7 @@ def _derive_direct_search_queries(query: str) -> list[str]:
         text = item.strip()
         if text and text not in deduped:
             deduped.append(text)
-    return deduped[:6]
+    return deduped[:4]
 
 
 def _is_query_grounded(candidate: str, user_query: str) -> bool:
@@ -284,7 +286,7 @@ def _derive_search_plan(outline: list[dict], sub_questions: list[str], _research
     if not plan:
         plan.append({"section_id": "sec_1", "query": query, "source_preference": "hybrid", "reason": "fallback"})
     deduped = _dedupe_sources(plan, ["query"])
-    return deduped[:6]
+    return deduped[:4]
 
 
 def _build_queries(state: ResearchState, source_preference: str) -> list[dict]:
@@ -307,7 +309,7 @@ def _build_queries(state: ResearchState, source_preference: str) -> list[dict]:
                 queries.append(item)
     if not queries:
         queries.append({"section_id": "sec_1", "query": state["query"], "source_preference": source_preference, "reason": "fallback"})
-    return queries[:6]
+    return queries[:4]
 
 
 def _extract_query_terms(query: str) -> list[str]:
@@ -866,37 +868,50 @@ def web_search_node(state: ResearchState, agent, agent_name: str) -> ResearchSta
     logger.info("%s 开始 | agent=%s", colorize("[web_search]", "cyan"), colorize(agent_name, "magenta"))
     queries = _build_queries(state, "web")
     logger.info("[web_search_node] 构建查询 | 查询数量=%s | queries=%s", len(queries), [q.get("query", "") for q in queries])
-    
+
     raw_records = []
     query_traces = state.get("web_search_trace", [])
-    
+
     iteration = state.get("iteration", 0)
     prefix = f"WEB{iteration+1}"
     logger.info("[web_search_node] 迭代信息 | iteration=%s | prefix=%s", iteration, prefix)
-    
-    for query_index, item in enumerate(queries, 1):
+
+    # 并行执行所有搜索查询（ThreadPoolExecutor，减少网络 I/O 等待）
+    def _search_one(item_with_index):
+        idx, item = item_with_index
         query_text = str(item.get("query", ""))
-        logger.info("[web_search_node] 执行第 %s/%s 个查询 | query=%s | section_id=%s", query_index, len(queries), query_text, item.get("section_id"))
-        # 优化点：减少单词请求返回的数量，从 count=6 降至 count=4，大幅减少无用 Token 消耗
-        records = bocha_web_search_records(query_text, count=4)
-        logger.info("[web_search_node] 查询 %s 返回 | 记录数=%s", query_index, len(records))
-        records = _assign_source_ids(records, f"{prefix}_{query_index}")
+        records = bocha_web_search_records(query_text, count=3)
+        records = _assign_source_ids(records, f"{prefix}_{idx}")
         for record in records:
             record["section_id"] = item.get("section_id")
             record["search_query"] = item.get("query")
-        raw_records.extend(records)
-        query_traces.append(
-            {
-                "iteration": iteration,
-                "plan_step": query_index,
-                "query": str(item.get("query", "")),
-                "section_id": item.get("section_id"),
-                "reason": item.get("reason", ""),
-                "source_preference": item.get("source_preference", "web"),
-                "raw_count": len(records),
-                "raw_records": _summarize_records(records),
-            }
-        )
+        return {
+            "query_index": idx,
+            "query_text": query_text,
+            "item": item,
+            "records": records,
+            "raw_count": len(records),
+        }
+
+    indexed_queries = list(enumerate(queries, 1))
+    with ThreadPoolExecutor(max_workers=min(len(indexed_queries), 4)) as pool:
+        futures = {pool.submit(_search_one, iq): iq for iq in indexed_queries}
+        for future in as_completed(futures):
+            try:
+                result = future.result()
+                raw_records.extend(result["records"])
+                query_traces.append({
+                    "iteration": iteration,
+                    "plan_step": result["query_index"],
+                    "query": result["query_text"],
+                    "section_id": result["item"].get("section_id"),
+                    "reason": result["item"].get("reason", ""),
+                    "source_preference": result["item"].get("source_preference", "web"),
+                    "raw_count": result["raw_count"],
+                    "raw_records": _summarize_records(result["records"]),
+                })
+            except Exception as exc:
+                logger.warning("[web_search_node] 查询失败: %s", exc)
     raw_records = _dedupe_sources(raw_records, ["url", "title"])
     raw_records = _minimal_record_filter(raw_records, ["title", "snippet", "url"])
 
@@ -995,7 +1010,7 @@ def local_rag_node(state: ResearchState, agent, agent_name: str) -> ResearchStat
     prefix = f"LOC{iteration+1}"
     
     for query_index, item in enumerate(queries, 1):
-        records = search_knowledge_base_records(str(item.get("query", "")), limit=4)
+        records = search_knowledge_base_records(str(item.get("query", "")), limit=3)
         records = _assign_source_ids(records, f"{prefix}_{query_index}")
         for record in records:
             record["section_id"] = item.get("section_id")
@@ -1071,35 +1086,19 @@ def local_rag_node(state: ResearchState, agent, agent_name: str) -> ResearchStat
 
 
 def deep_dive_node(state: ResearchState, agent, agent_name: str) -> ResearchState:
-    logger.info("%s 开始 | agent=%s", colorize("[deep_dive]", "cyan"), colorize(agent_name, "magenta"))
+    logger.info("%s 开始（程序化评分，跳过 LLM 调用） | agent=%s", colorize("[deep_dive]", "cyan"), colorize(agent_name, "magenta"))
     if not state.get("web_evidence") and not state.get("local_evidence"):
         logger.info("%s 等待检索结果", colorize("[deep_dive]", "yellow"))
         return {}
+
+    # 直接使用程序化评分，省去一次 LLM 调用（~4-8s）
+    # _fallback_audit 已包含：可靠性评分、去重、低置信度标记、来源索引
     fallback = _fallback_audit(state)
-    payload, content, messages = _invoke_json_agent(
-        state,
-        "请对 web 与 local 证据进行评分、去重、冲突审计，并只输出 JSON。\n"
-        f"问题：{state['query']}\n"
-        f"子问题：{json.dumps(state.get('sub_questions', []), ensure_ascii=False)}\n"
-        f"web_evidence：{json.dumps(_trim_evidence_for_llm(state.get('web_evidence', [])), ensure_ascii=False)}\n"
-        f"local_evidence：{json.dumps(_trim_evidence_for_llm(state.get('local_evidence', [])), ensure_ascii=False)}",
-        agent,
-        agent_name,
-        "deep_dive",
-        fallback,
-    )
-    payload_pool = payload.get("evidence_pool") if isinstance(payload.get("evidence_pool"), list) else []
+    evidence_pool = fallback["evidence_pool"]
+    audit_flags = fallback["audit_flags"]
+
+    # 补全 raw_evidence 中可能未被覆盖的记录
     raw_evidence = state.get("web_evidence", []) + state.get("local_evidence", [])
-    allowed_source_ids = {str(item.get("source_id", "")).strip() for item in raw_evidence if item.get("source_id")}
-    evidence_pool = []
-    for item in payload_pool:
-        if not isinstance(item, dict):
-            continue
-        sid = str(item.get("source_id", "")).strip()
-        if sid and sid in allowed_source_ids:
-            evidence_pool.append(item)
-    if not evidence_pool:
-        evidence_pool = fallback["evidence_pool"]
     existing_ids = {str(item.get("source_id", "")).strip() for item in evidence_pool if isinstance(item, dict)}
     for record in raw_evidence:
         sid = str(record.get("source_id", "")).strip()
@@ -1121,7 +1120,7 @@ def deep_dive_node(state: ResearchState, agent, agent_name: str) -> ResearchStat
             }
         )
         existing_ids.add(sid)
-    audit_flags = payload.get("audit_flags") if isinstance(payload.get("audit_flags"), list) else fallback["audit_flags"]
+
     source_index = []
     for item in evidence_pool:
         if not isinstance(item, dict):
@@ -1139,12 +1138,12 @@ def deep_dive_node(state: ResearchState, agent, agent_name: str) -> ResearchStat
         )
     source_index = _dedupe_sources(source_index, ["source_id"])
     return {
-        "deep_dive": payload.get("summary", content),
-        "audit": payload.get("summary", content),
+        "deep_dive": fallback.get("summary", "程序化证据评分完成"),
+        "audit": fallback.get("summary", "程序化证据评分完成"),
         "evidence_pool": evidence_pool,
         "audit_flags": audit_flags,
         "source_index": source_index,
-        "messages": messages,
+        "messages": [],
     }
 
 

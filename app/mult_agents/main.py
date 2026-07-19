@@ -1,10 +1,5 @@
 """运行主入口：构建 Agent、初始化记忆与 checkpointer，并驱动工作流执行。"""
 
-"""
- * 小滴课堂,愿景：让技术不再难学
- * @Remark 有问题联系我【xdclass68】
- * 源码-笔记-技术交流群,官网 https://xdclass.net
-"""
 import argparse
 import json
 import importlib

@@ -31,9 +31,9 @@ def build_chat_model(
         temperature=temperature,
         openai_api_key=api_key or None,
         openai_api_base=base_url.rstrip("/") if base_url else "https://api.deepseek.com/v1",
-        max_tokens=8192,
-        timeout=120,
-        max_retries=2,
+        max_tokens=4096,
+        timeout=45,
+        max_retries=1,
     )
 
 

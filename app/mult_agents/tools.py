@@ -3,9 +3,11 @@
 import json
 import logging
 import os
+import time
 import urllib.error
 import urllib.request
 
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Optional
 from .rag.core import RAGSystem, RAGConfig
 
@@ -13,6 +15,10 @@ logger = logging.getLogger("mult_agents")
 
 # 全局 RAG 系统实例
 _RAG_SYSTEM: Optional[RAGSystem] = None
+
+# 搜索缓存（避免短时间内重复搜索同一 query）
+_SEARCH_CACHE: dict[str, tuple[float, list[dict]]] = {}
+_SEARCH_CACHE_TTL = 300  # 5 分钟缓存
 
 def init_rag_system(config: Optional[RAGConfig] = None):
     """初始化全局 RAG 系统"""
@@ -38,7 +44,7 @@ def _duckduckgo_search_records(query: str, count: int = 8) -> list[dict]:
     records: list[dict] = []
     try:
         from ddgs import DDGS
-        with DDGS() as ddgs:
+        with DDGS(timeout=15) as ddgs:
             results = list(ddgs.text(query, max_results=count))
         for idx, r in enumerate(results, 1):
             records.append({
@@ -66,13 +72,23 @@ def _extract_domain(url: str) -> str:
 
 
 def bocha_web_search_records(query: str, count: int = 8) -> list[dict]:
+    # 检查缓存（避免短时间内重复搜索，DDG 尤其需要）
+    cache_key = f"{query[:80]}:{count}"
+    if cache_key in _SEARCH_CACHE:
+        cached_time, cached_records = _SEARCH_CACHE[cache_key]
+        if time.time() - cached_time < _SEARCH_CACHE_TTL:
+            logger.info("[web_search] 缓存命中 | query=%s | 结果=%s", query[:40], len(cached_records))
+            return cached_records
+
     api_key = os.getenv("BOCHA_API_KEY", "").strip()
     logger.info("[web_search] 开始搜索 | query=%s | count=%s", query, count)
 
     if not api_key:
         # Bocha 没配 → 降级到免费的 DuckDuckGo
         logger.info("[web_search] BOCHA_API_KEY 未配置，使用 DuckDuckGo 免费搜索")
-        return _duckduckgo_search_records(query, count)
+        records = _duckduckgo_search_records(query, count)
+        _SEARCH_CACHE[cache_key] = (time.time(), records)
+        return records
     payload = {
         "query": query,
         "summary": True,
@@ -143,6 +159,9 @@ def bocha_web_search_records(query: str, count: int = 8) -> list[dict]:
             }
         )
     logger.info("[bocha_web_search] 搜索完成 | 返回记录数=%s", len(records))
+    # 写入缓存
+    cache_key = f"{query[:80]}:{count}"
+    _SEARCH_CACHE[cache_key] = (time.time(), records)
     return records
 
 
@@ -458,10 +477,38 @@ def collect_finance_data_records(query: str) -> list[dict]:
         return all_records
 
     logger.info("[finance] 检测到股票代码: %s", stock_code)
-
-    # 获取个股信息（PE/PB/市值等）
-    info = fetch_stock_info_record(stock_code)
     short_code = stock_code[2:] if stock_code.startswith(("sz", "sh")) else stock_code
+
+    # 并行获取个股信息、财务指标、新闻（3 路并发，减少 I/O 等待）
+    info = None
+    fin_records = []
+    news_records = []
+
+    def _fetch_info():
+        return fetch_stock_info_record(stock_code)
+
+    def _fetch_financials():
+        return fetch_financial_indicators_records(stock_code)
+
+    def _fetch_news():
+        return fetch_stock_news_records(stock_code, limit=8)
+
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        future_info = pool.submit(_fetch_info)
+        future_fin = pool.submit(_fetch_financials)
+        future_news = pool.submit(_fetch_news)
+        for future in as_completed([future_info, future_fin, future_news]):
+            try:
+                result = future.result()
+                if future == future_info:
+                    info = result
+                elif future == future_fin:
+                    fin_records = result
+                elif future == future_news:
+                    news_records = result
+            except Exception as exc:
+                logger.warning("[finance] 并行获取金融数据失败: %s", exc)
+
     if info:
         name = info.get("name", "")
         pe = info.get("pe", 0)
@@ -482,17 +529,13 @@ def collect_finance_data_records(query: str) -> list[dict]:
             "data_type": "company_info",
         })
 
-    # 获取财务指标（同花顺数据源）
-    fin_records = fetch_financial_indicators_records(stock_code)
-    if fin_records and "error" not in fin_records[0]:
+    if fin_records and "error" not in (fin_records[0] if fin_records else {}):
         for record in fin_records:
             record["domain"] = "10jqka.com.cn"
             record["reliability_hint"] = "data_provider"
         all_records.extend(fin_records[:8])
 
-    # 获取新闻
-    news_records = fetch_stock_news_records(stock_code, limit=8)
-    if news_records and "error" not in news_records[0]:
+    if news_records and "error" not in (news_records[0] if news_records else {}):
         for record in news_records:
             record["domain"] = "eastmoney"
             record["reliability_hint"] = "media"
