@@ -28,8 +28,6 @@
 - [项目结构](#-项目结构)
 - [可选增强](#-可选增强)
 - [常见问题](#-常见问题)
-- [文档](#-文档)
-- [License](#-license)
 
 ---
 
@@ -463,25 +461,3 @@ DeepSeek 是目前性价比最高的大模型 API 之一，deepseek-chat 约 ¥1
 </details>
 
 ---
-
-## 📚 文档
-
-完整代码解析见 [docs/](docs/) 目录：
-
-| # | 文档 | 内容 |
-|---|------|------|
-| 01 | [架构总览与配置](docs/01-架构总览与配置.md) | 系统全景、数据流、配置体系 |
-| 02 | [工作流与智能体](docs/02-工作流与智能体.md) | State、Graph、Prompt、执行时序 |
-| 03 | [节点执行引擎](docs/03-节点执行引擎.md) | nodes.py 逐函数深度解析 |
-| 04 | [数据工具层](docs/04-数据工具层.md) | DuckDuckGo + AKShare 全部函数 |
-| 05 | [记忆系统](docs/05-记忆系统.md) | 三层记忆架构 + Prompt 注入 |
-| 06 | [知识库系统](docs/06-知识库系统.md) | Milvus RAG + 文档入库管道 |
-| 07 | [后端服务层](docs/07-后端服务层.md) | FastAPI + SSE + WorkflowService |
-| 08 | [前端界面](docs/08-前端界面.md) | Vue 3 组件与 Markdown 渲染 |
-| 09 | [部署与依赖](docs/09-部署与依赖.md) | 启动方式 + 环境变量 + FAQ |
-
----
-
-## 📄 License
-
-MIT © [CHIRT39-a](https://github.com/CHIRT39-a)
