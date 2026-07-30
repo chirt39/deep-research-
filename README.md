@@ -14,7 +14,7 @@
 </p>
 
 <p align="center">
-  <img src="assets/screenshot.png" alt="DeepResearch 前端界面" width="800">
+  <img src="assets/image.png" alt="DeepResearch 前端界面" width="800">
 </p>
 
 ---
