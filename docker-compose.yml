@@ -1,0 +1,106 @@
+version: "3.8"
+
+services:
+  # ═══════════════════════════════════════════════════════
+  # 基础设施
+  # ═══════════════════════════════════════════════════════
+
+  redis:
+    image: redis/redis-stack:latest
+    container_name: dr-redis
+    ports:
+      - "6379:6379"
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  postgres:
+    image: postgres:16
+    container_name: dr-postgres
+    ports:
+      - "5432:5432"
+    environment:
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: deep_research
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d deep_research"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  milvus:
+    image: milvusdb/milvus:v2.4.0
+    container_name: dr-milvus
+    ports:
+      - "19530:19530"
+      - "9091:9091"
+    environment:
+      MILVUS_CONFIG_CPU_CACHE_CAPACITY: 2
+    volumes:
+      - milvus_data:/var/lib/milvus
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9091/healthz"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+
+  # ═══════════════════════════════════════════════════════
+  # 应用服务
+  # ═══════════════════════════════════════════════════════
+
+  backend:
+    build:
+      context: .
+      dockerfile: Dockerfile.backend
+    container_name: dr-backend
+    ports:
+      - "8000:8000"
+    environment:
+      - DEEPSEEK_API_KEY=${DEEPSEEK_API_KEY}
+      - BOCHA_API_KEY=${BOCHA_API_KEY:-}
+      - MAX_ITERATIONS=2
+      - REDIS_URL=redis://redis:6379
+      - POSTGRES_DSN=postgresql://postgres:postgres@postgres:5432/deep_research
+      - MILVUS_HOST=milvus
+      - MILVUS_PORT=19530
+      - CHECKPOINTER_BACKEND=redis
+      - ENABLE_MEMORY=true
+      - ENABLE_MILVUS=true
+      - SHORT_TERM_BACKEND=postgres
+      - LONG_TERM_BACKEND=postgres
+      - EMBEDDING_PROVIDER=huggingface
+    depends_on:
+      redis:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+      milvus:
+        condition: service_healthy
+    restart: unless-stopped
+    volumes:
+      - ./knowledge_base:/app/knowledge_base
+
+  frontend:
+    build:
+      context: .
+      dockerfile: Dockerfile.frontend
+    container_name: dr-frontend
+    ports:
+      - "5173:5173"
+    environment:
+      - VITE_API_BASE_URL=http://backend:8000
+    depends_on:
+      - backend
+    restart: unless-stopped
+
+volumes:
+  pgdata:
+  milvus_data:

@@ -13,6 +13,10 @@
   <img src="https://img.shields.io/badge/license-MIT-green" alt="License">
 </p>
 
+<p align="center">
+  <img src="assets/screenshot.png" alt="DeepResearch 前端界面" width="800">
+</p>
+
 ---
 
 ## 📖 目录

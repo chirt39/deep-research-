@@ -42,6 +42,7 @@ langchain-openai>=0.3.0
 sentence-transformers>=3.0.0
 akshare>=1.16.0
 ddgs>=7.0.0
+pypdf>=5.0.0
 langchain-core==1.0.5
 langchain-mcp-adapters==0.1.14
 langchain-milvus==0.3.3
