@@ -68,6 +68,13 @@ def test_rate_limiter_window():
     assert limiter.allow("client-b") is True
 
 
+def test_auth_token_uses_documented_env_name(monkeypatch):
+    from app.backend.config import AppSettings
+
+    monkeypatch.setenv("AUTH_TOKEN", "test-token")
+    assert AppSettings().api_token == "test-token"
+
+
 def test_rate_limiter_disabled_when_zero():
     from app.backend.security import SlidingWindowRateLimiter
 

@@ -37,9 +37,9 @@ services:
     image: milvusdb/milvus:v2.4.0
     container_name: dr-milvus
     command: ["milvus", "run", "standalone"]
-    ports:
-      - "19530:19530"
-      - "9091:9091"
+    expose:
+      - "19530"
+      - "9091"
     environment:
       ETCD_USE_EMBED: "true"
       ETCD_DATA_DIR: /var/lib/milvus/etcd
