@@ -12,6 +12,12 @@ DeepResearch 是一个面向企业知识研究、技术调研和金融投研的 
 
 项目适合用于展示 AI 应用开发、RAG、Agent Workflow、FastAPI 服务化、SSE 流式响应、Docker 部署和上线维护能力。
 
+## 前端界面
+
+![DeepResearch 前端研究工作台](assets/deepresearch-ui.png)
+
+前端支持研究域选择、研究过程展示、报告历史、证据摘要和 Markdown 报告下载。
+
 ## 主要能力
 
 - **双研究域**：支持 `general` 企业/技术研究和 `finance` 金融投研，`auto` 模式可根据问题自动识别领域。
