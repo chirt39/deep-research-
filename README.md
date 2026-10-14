@@ -1,7 +1,7 @@
 <p align="center">
   <h1 align="center">🔬 DeepResearch</h1>
-  <p align="center"><strong>金融多智能体深度投研平台</strong></p>
-  <p align="center">9 个 AI Agent 协作，输入股票代码，自动产出专业投研报告</p>
+  <p align="center"><strong>企业知识库 + 网络研究融合的多智能体研究平台</strong></p>
+  <p align="center">同一套 Agent 工作流支持技术调研、企业知识库问答与金融深度研究</p>
 </p>
 
 <p align="center">
@@ -78,6 +78,10 @@
 - 📚 **本地知识库** — 灌入券商研报/年报，与公开数据交叉验证
 - ⚡ **流式输出** — SSE 实时推送每个 Agent 的进度
 - 🎯 **智能路由** — 简单问答秒回，复杂研究自动进入多 Agent 流程
+- 🧭 **公司名自动识别** — 内置常见 A 股/港股/美股名称映射，只写公司名也能取到数据
+- 🌏 **港股/美股行情** — AKShare 免费行情接口，覆盖腾讯/苹果/特斯拉等常见标的
+- 🗂️ **报告历史** — 本地留存每次报告，前端可回看、复制、下载
+- ⭐ **双层质检** — 规则自检（0-100 分）+ 可选 LLM-as-Judge 评审
 
 ---
 
@@ -92,7 +96,7 @@
 ### 1. 克隆项目
 
 ```bash
-git clone https://github.com/CHIRT39-a/deep-research.git
+git clone https://github.com/chirt39/deep-research-.git
 cd deep-research
 ```
 
@@ -123,9 +127,12 @@ DEEPSEEK_API_KEY=sk-你的密钥
 }
 ```
 
-> 仅此一项即可运行！其余均有默认值。
+> 仅此一项即可运行！其余均有默认值。未创建 `config.json` 时，系统会自动回退为
+> 纯 `.env` / 环境变量模式，全部配置均可用环境变量覆盖（见「配置项」）。
 
 ### 4. 启动
+
+> 研究接口支持 `research_domain=auto|general|finance`。通用企业/技术调研使用 `general`，金融问题使用 `finance`，不传则自动识别。
 
 **命令行模式（最快体验）：**
 
@@ -144,13 +151,15 @@ python -m app.mult_agents.main
 
 ```bash
 # 终端 1 — 后端
-python -m uvicorn app.app_main:app --host 0.0.0.0 --port 8000 --reload
+python -m uvicorn app.app_main:app --host 127.0.0.1 --port 8000 --reload
 
 # 终端 2 — 前端
 cd front/agent_front && npm run dev
 ```
 
 浏览器打开 `http://localhost:5173`，输入问题即可。
+如确需局域网访问，请设置 `AUTH_TOKEN` 环境变量（请求需携带
+`Authorization: Bearer <token>`），并自行评估限流策略（默认每 IP 每分钟 30 次）。
 
 ---
 
@@ -259,6 +268,7 @@ cd front/agent_front && npm run dev
 | **AKShare（东方财富）** | 个股信息 | PE / PB / 总市值 / 行业 / 上市日期 | ✗ |
 | **AKShare（东方财富）** | 个股新闻 | 公司公告 / 舆情事件 | ✗ |
 | **AKShare** | 宏观指标 | CPI / PMI / GDP / M2 / LPR / 社融 | ✗ |
+| **AKShare** | 港股/美股历史行情 | 腾讯/美团/苹果/特斯拉等常见标的（财务与新闻暂未覆盖） | ✗ |
 | **Bocha** | 高质量搜索 | 中文网页（速度快于 DDG） | ✓ |
 
 > 💡 **建议配置 `BOCHA_API_KEY`** 以使用 Bocha 搜索。DuckDuckGo 免费但可能被限速。去 [bocha.cn](https://ai.bocha.cn) 注册免费额度。
@@ -290,11 +300,21 @@ BOCHA_API_KEY=xxx                # Bocha 搜索 API Key（可选）
 DEEPSEEK_MODEL=deepseek-chat     # LLM 模型
 MAX_ITERATIONS=2                 # 最大迭代次数
 EMBEDDING_PROVIDER=huggingface   # 嵌入后端
-```
+LLM_EVIDENCE=true                # 网页证据改用 LLM 整理（默认程序化筛选）
+LLM_EVIDENCE_JUDGE=true          # 证据裁判改用 LLM 交叉验证（默认程序化评分，更慢但更细致）
+LLM_AS_JUDGE=true                # 写作后启用 LLM 质量评审（双层质检，默认关闭）
+AUTH_TOKEN=xxx                   # API Token（可选；配置后 /api/v1/research/* 需 Bearer 鉴权）
+DEEPSEEK_INPUT_PRICE_PER_M=1     # 输入 token 单价（元/百万，成本统计用）
+DEEPSEEK_OUTPUT_PRICE_PER_M=2    # 输出 token 单价（元/百万，成本统计用）
+ ```
 
 ---
 
 ## 🔌 API 接口
+
+> 🔒 安全说明：后端默认只监听 `127.0.0.1`。设置 `AUTH_TOKEN` 后，
+> `/api/v1/research/*` 需携带 `Authorization: Bearer <token>`；
+> 接口默认按客户端 IP 限流（`RATE_LIMIT_PER_MINUTE`，默认 30 次/分钟）。
 
 ### POST `/api/v1/research/run`
 
@@ -316,7 +336,23 @@ EMBEDDING_PROVIDER=huggingface   # 嵌入后端
   "final": "## 投资摘要\n比亚迪当前 PE 25x...",
   "route": "multiagent",
   "thread_id": "session_001",
-  "user_id": "user_001"
+  "user_id": "user_001",
+  "usage": {
+    "calls": 4,
+    "input_tokens": 8200,
+    "output_tokens": 3100,
+    "cost_yuan": 0.0144,
+    "elapsed_seconds": 118.0
+  },
+  "quality": {
+    "score": 100,
+    "checks": [
+      { "name": "结构完整性", "passed": true, "detail": "关键章节覆盖 6/6" },
+      { "name": "引用溯源", "passed": true, "detail": "正文引用 5 条" },
+      { "name": "篇幅控制", "passed": true, "detail": "1860 字" },
+      { "name": "五维覆盖", "passed": true, "detail": "结论覆盖维度 5 个" }
+    ]
+  }
 }
 ```
 
@@ -331,6 +367,11 @@ curl -X POST http://localhost:8000/api/v1/research/stream \
 ```
 
 事件类型：`phase`（节点进度）、`route`（路由结果）、`final`（最终报告）、`error`（异常）。
+`final` 事件额外携带 `usage`（LLM 调用次数、token 数、估算成本）与 `quality`（报告质量自检分）。
+
+### GET `/api/v1/research/history` / `GET /api/v1/research/history/{report_id}`
+
+报告历史：`history` 返回最近报告列表（元信息），`history/{id}` 返回单份报告全文。
 
 ---
 
@@ -384,6 +425,8 @@ deep-research/
 └── README.md                          # 本文件
 ```
 
+本轮工程化改造说明见：[企业研究模式与改造设计](docs/11-企业研究模式与改造设计.md)、[上线维护与评估](docs/12-上线维护与评估.md)。
+
 ---
 
 ## 🔧 可选增强
@@ -394,8 +437,13 @@ deep-research/
 
 ```bash
 # 1. 启动 Milvus
+# 极简 standalone 模式：嵌入式 etcd + 本地存储，无需额外启动 MinIO/etcd
 docker run -d --name milvus \
   -p 19530:19530 -p 9091:9091 \
+  -e ETCD_USE_EMBED=true \
+  -e ETCD_DATA_DIR=/var/lib/milvus/etcd \
+  -e COMMON_STORAGETYPE=local \
+  -v milvus_data:/var/lib/milvus \
   milvusdb/milvus:latest
 
 # 2. 灌入文档
@@ -438,12 +486,25 @@ export BOCHA_API_KEY=your_key
 ## ❓ 常见问题
 
 <details>
-<summary><strong>为什么一次研究要几十秒到 1-2 分钟？</strong></summary>
+<summary><strong>为什么一次研究要 2-4 分钟？怎么让它更快？</strong></summary>
 
-每次研究涉及 4-6 次 LLM 调用 + 多次网页搜索 + 金融数据 API 调用。LLM 生成、网络 I/O、数据解析都需要时间。相比人工研究的数小时，2 分钟内产出结构化研报是可以接受的。如果特别慢（>3 分钟），检查：
-- DuckDuckGo 是否被限速（建议配置 `BOCHA_API_KEY`）
-- 网络到 DeepSeek API 是否通畅
-- 是否在没有 PostgreSQL/Redis 的环境下开启了 memory 功能
+耗时构成：3-5 次 LLM 调用（每次约 5-15s）+ 多轮网页搜索（DuckDuckGo 免费接口较慢，每轮 30-60s）+ AKShare 金融数据采集。
+
+项目已内置以下优化（实测有效）：
+- 网页搜索与金融数据采集并行执行，互不阻塞；
+- 默认跳过 LLM 证据整理环节，改用程序化筛选（设置 `LLM_EVIDENCE=true` 可恢复 LLM 整理）；
+- JSON 类节点按角色降低 `max_tokens`（1024-2048），写作节点保留 4096；
+- DuckDuckGo 单请求超时 15s→8s，补搜轮次查询数 4→3；
+- 搜索结果（5 分钟）与金融数据（10 分钟）带 TTL 缓存。
+
+实测（DeepSeek deepseek-chat + DuckDuckGo，查询"比亚迪 002594 估值分析"）：
+- `MAX_ITERATIONS=2`（默认）：约 3 分钟；
+- `MAX_ITERATIONS=1`：约 2 分钟。
+
+进一步加速：
+- 配置 `BOCHA_API_KEY` 可大幅缩短搜索时间（DuckDuckGo 免费接口易被限速）；
+- 降低 `MAX_ITERATIONS` 减少补搜轮次（CLI 可用 `--max-iterations 1`）；
+- 确保网络到 DeepSeek API 通畅。
 </details>
 
 <details>

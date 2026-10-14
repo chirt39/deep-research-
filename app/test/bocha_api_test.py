@@ -66,9 +66,10 @@ def summarize_result(name: str, result: dict):
 
 
 def main():
-    api_key = "sk-6e8cb31f25f6421eb555e79ee12e910d"
+    api_key = os.environ.get("BOCHA_API_KEY", "").strip()
     if not api_key:
-        raise ValueError("缺少 BOCHA_API_KEY 环境变量")
+        print("未配置 BOCHA_API_KEY 环境变量，跳过测试（请先到 Bocha 后台生成 Key）。")
+        return
     try:
         web_result = call_bocha_api(WEB_SEARCH_ENDPOINT, api_key, WEB_SEARCH_PAYLOAD)
         summarize_result("Web Search", web_result)

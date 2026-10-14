@@ -121,13 +121,13 @@ class AppConfig:
 
         # ── 嵌入模型 ──
         embedding_provider = AppConfig._resolve_str(
-            data, "embedding_provider", "EMBEDDING_PROVIDER", "openai"
+            data, "embedding_provider", "EMBEDDING_PROVIDER", "huggingface"
         ).lower()
         embedding_api_key = AppConfig._resolve_str(
             data, "embedding_api_key", "EMBEDDING_API_KEY", api_key
         )
         embedding_model = AppConfig._resolve_str(
-            data, "embedding_model", "EMBEDDING_MODEL", "text-embedding-3-small"
+            data, "embedding_model", "EMBEDDING_MODEL", "BAAI/bge-small-zh-v1.5"
         )
         embedding_base_url = AppConfig._resolve_str(
             data, "embedding_base_url", "EMBEDDING_BASE_URL", ""
@@ -139,10 +139,10 @@ class AppConfig:
         tenant_id = AppConfig._resolve_str(data, "tenant_id", "TENANT_ID", "default_tenant")
 
         # ── 工作流 ──
-        max_iterations = AppConfig._resolve_int(data, "max_iterations", "MAX_ITERATIONS", 3)
+        max_iterations = AppConfig._resolve_int(data, "max_iterations", "MAX_ITERATIONS", 2)
 
         # ── 记忆 ──
-        enable_memory = AppConfig._resolve_bool(data, "enable_memory", "ENABLE_MEMORY", True)
+        enable_memory = AppConfig._resolve_bool(data, "enable_memory", "ENABLE_MEMORY", False)
         short_term_ttl_seconds = AppConfig._resolve_int(
             data, "short_term_ttl_seconds", "SHORT_TERM_TTL_SECONDS", 604800
         )
@@ -165,9 +165,9 @@ class AppConfig:
             data, "save_conversation_task", "SAVE_CONVERSATION_TASK", False
         )
         checkpointer_backend = AppConfig._resolve_str(
-            data, "checkpointer_backend", "CHECKPOINTER_BACKEND", "auto"
+            data, "checkpointer_backend", "CHECKPOINTER_BACKEND", "memory"
         ).lower()
-        enable_milvus = AppConfig._resolve_bool(data, "enable_milvus", "ENABLE_MILVUS", True)
+        enable_milvus = AppConfig._resolve_bool(data, "enable_milvus", "ENABLE_MILVUS", False)
         memory_top_k = AppConfig._resolve_int(data, "memory_top_k", "MEMORY_TOP_K", 6)
 
         # ── 基础设施 ──
@@ -219,7 +219,7 @@ class AppConfig:
         api_key = AppConfig._resolve_str(data, "api_key", "DEEPSEEK_API_KEY", "")
         if not api_key:
             raise ValueError("缺少 DEEPSEEK_API_KEY 环境变量")
-        return AppConfig.from_file.__wrapped__ if hasattr(AppConfig.from_file, "__wrapped__") else AppConfig(
+        return AppConfig(
             api_key=api_key,
             model=AppConfig._resolve_str(data, "model", "DEEPSEEK_MODEL", "deepseek-chat"),
             base_url=AppConfig._resolve_str(data, "base_url", "DEEPSEEK_BASE_URL", "https://api.deepseek.com/v1"),
@@ -231,8 +231,8 @@ class AppConfig:
             thread_id=AppConfig._resolve_str(data, "thread_id", "THREAD_ID", "default"),
             user_id=AppConfig._resolve_str(data, "user_id", "USER_ID", "default_user"),
             tenant_id=AppConfig._resolve_str(data, "tenant_id", "TENANT_ID", "default_tenant"),
-            max_iterations=AppConfig._resolve_int(data, "max_iterations", "MAX_ITERATIONS", 3),
-            enable_memory=AppConfig._resolve_bool(data, "enable_memory", "ENABLE_MEMORY", True),
+            max_iterations=AppConfig._resolve_int(data, "max_iterations", "MAX_ITERATIONS", 2),
+            enable_memory=AppConfig._resolve_bool(data, "enable_memory", "ENABLE_MEMORY", False),
             short_term_ttl_seconds=AppConfig._resolve_int(data, "short_term_ttl_seconds", "SHORT_TERM_TTL_SECONDS", 604800),
             short_term_max_messages=AppConfig._resolve_int(data, "short_term_max_messages", "SHORT_TERM_MAX_MESSAGES", 30),
             short_term_summary_threshold=AppConfig._resolve_int(data, "short_term_summary_threshold", "SHORT_TERM_SUMMARY_THRESHOLD", 20),
@@ -240,8 +240,8 @@ class AppConfig:
             long_term_backend=AppConfig._resolve_str(data, "long_term_backend", "LONG_TERM_BACKEND", "postgres").lower(),
             long_term_scope=AppConfig._resolve_str(data, "long_term_scope", "LONG_TERM_SCOPE", "user").lower(),
             save_conversation_task=AppConfig._resolve_bool(data, "save_conversation_task", "SAVE_CONVERSATION_TASK", False),
-            checkpointer_backend=AppConfig._resolve_str(data, "checkpointer_backend", "CHECKPOINTER_BACKEND", "auto").lower(),
-            enable_milvus=AppConfig._resolve_bool(data, "enable_milvus", "ENABLE_MILVUS", True),
+            checkpointer_backend=AppConfig._resolve_str(data, "checkpointer_backend", "CHECKPOINTER_BACKEND", "memory").lower(),
+            enable_milvus=AppConfig._resolve_bool(data, "enable_milvus", "ENABLE_MILVUS", False),
             memory_top_k=AppConfig._resolve_int(data, "memory_top_k", "MEMORY_TOP_K", 6),
             redis_url=AppConfig._resolve_str(data, "redis_url", "REDIS_URL", "redis://127.0.0.1:6379"),
             postgres_dsn=AppConfig._resolve_str(data, "postgres_dsn", "POSTGRES_DSN", "postgresql://127.0.0.1:5432/postgres"),
@@ -249,3 +249,13 @@ class AppConfig:
             milvus_port=AppConfig._resolve_int(data, "milvus_port", "MILVUS_PORT", 19530),
             milvus_collection=AppConfig._resolve_str(data, "milvus_collection", "MILVUS_COLLECTION", "mult_agent_memory"),
         )
+
+    @staticmethod
+    def load(path: str | Path | None = None) -> "AppConfig":
+        """优先读取 config.json；默认路径不存在时回退纯环境变量（.env-only 启动）。"""
+        config_path = Path(path) if path else AppConfig._default_config_path()
+        if config_path.exists():
+            return AppConfig.from_file(config_path)
+        if path is None or config_path == AppConfig._default_config_path():
+            return AppConfig.from_env()
+        raise FileNotFoundError(f"配置文件不存在: {config_path}")

@@ -70,7 +70,7 @@ def main():
     args = parser.parse_args()
 
     # 加载配置
-    config = AppConfig.from_file()
+    config = AppConfig.load()
 
     collection = args.collection or config.milvus_collection
     if collection == "mult_agent_memory":

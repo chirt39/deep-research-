@@ -6,12 +6,15 @@ import os
 import re
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime
 from functools import partial
 
 from langchain_core.messages import HumanMessage
 
 from .state import ResearchState
 from .tools import bocha_web_search_records, search_knowledge_base_records, collect_finance_data_records
+from .usage import estimate_cost, estimate_tokens
+from .research_profile import research_guidance, resolve_research_domain
 
 
 logger = logging.getLogger("mult_agents")
@@ -64,10 +67,12 @@ def collect_tool_calls(messages) -> tuple[list, list]:
 
 
 def with_memory_context(state: ResearchState, user_prompt: str) -> str:
+    domain = resolve_research_domain(state.get("research_domain", "auto"), state.get("query", ""))
+    domain_context = f"[研究域约束]\n{research_guidance(domain)}"
     memory_context = state.get("memory_context", "").strip()
     if not memory_context:
-        return user_prompt
-    return f"{user_prompt}\n\n[跨会话记忆]\n{memory_context}"
+        return f"{domain_context}\n\n{user_prompt}"
+    return f"{domain_context}\n\n{user_prompt}\n\n[跨会话记忆]\n{memory_context}"
 
 
 def log_inputs(node: str, agent_name: str, payload: dict):
@@ -129,6 +134,33 @@ def detect_intent(query: str) -> str:
     return "multiagent" if any(word in query for word in keywords) else "direct"
 
 
+_GREETING_KEYWORDS = (
+    "你好",
+    "您好",
+    "hello",
+    "hi",
+    "嗨",
+    "在吗",
+    "早上好",
+    "中午好",
+    "下午好",
+    "晚上好",
+    "谢谢",
+    "感谢",
+    "再见",
+    "拜拜",
+    "辛苦了",
+)
+
+
+def _is_greeting_query(query: str) -> bool:
+    """判断是否为问候/极短句（用于跳过 LLM 直接应答）。"""
+    normalized = query.strip().lower()
+    if not normalized or len(normalized) > 20:
+        return False
+    return any(keyword in normalized for keyword in _GREETING_KEYWORDS)
+
+
 def bind_agent(node_func, agent, agent_name: str):
     return partial(node_func, agent=agent, agent_name=agent_name)
 
@@ -164,7 +196,21 @@ def _load_json(text: str, fallback: dict) -> dict:
     return fallback
 
 
-def _invoke_json_agent(state: ResearchState, prompt: str, agent, agent_name: str, node: str, fallback: dict) -> tuple[dict, str, list]:
+def _make_usage(node: str, agent_name: str, input_text: str, output_text: str, elapsed: float) -> dict:
+    """生成单次 LLM 调用的用量记录（token 为启发式估算）。"""
+    input_tokens = estimate_tokens(input_text)
+    output_tokens = estimate_tokens(output_text)
+    return {
+        "node": node,
+        "agent": agent_name,
+        "input_tokens": input_tokens,
+        "output_tokens": output_tokens,
+        "cost_yuan": estimate_cost(input_tokens, output_tokens),
+        "elapsed_seconds": round(elapsed, 1),
+    }
+
+
+def _invoke_json_agent(state: ResearchState, prompt: str, agent, agent_name: str, node: str, fallback: dict) -> tuple[dict, str, list, dict]:
     human = HumanMessage(content=with_memory_context(state, prompt))
     t0 = time.time()
     result = agent.invoke({"messages": [human]})
@@ -176,7 +222,8 @@ def _invoke_json_agent(state: ResearchState, prompt: str, agent, agent_name: str
         logger.info("%s 工具输出: %s", colorize(f"[{node}]", "green"), item[:400])
     content = _last_content(result)
     emit(node, content)
-    return _load_json(content, fallback), content, [human, result["messages"][-1]]
+    usage = _make_usage(node, agent_name, prompt, content, time.time() - t0)
+    return _load_json(content, fallback), content, [human, result["messages"][-1]], usage
 
 
 def _default_plan(state: ResearchState) -> dict:
@@ -259,15 +306,7 @@ def _is_query_grounded(candidate: str, user_query: str) -> bool:
 
 def _derive_search_plan(outline: list[dict], sub_questions: list[str], _research_questions: list[str], query: str) -> list[dict]:
     plan: list[dict] = []
-    for direct_query in _derive_direct_search_queries(query):
-        plan.append(
-            {
-                "section_id": "user_query",
-                "query": direct_query,
-                "source_preference": "hybrid",
-                "reason": "围绕用户原始问题生成的直接检索词",
-            }
-        )
+    # 优先使用大纲/子问题生成的定向检索词（更有针对性），避免被通用兜底词挤掉
     for section in outline:
         if not isinstance(section, dict):
             continue
@@ -283,6 +322,17 @@ def _derive_search_plan(outline: list[dict], sub_questions: list[str], _research
                         "reason": f"来自大纲章节 {section_id}",
                     }
                 )
+    # 通用兜底检索词只保留前 2 条，避免占满搜索计划
+    for direct_query in _derive_direct_search_queries(query)[:2]:
+        if not any(str(item.get("query", "")).strip() == direct_query for item in plan):
+            plan.append(
+                {
+                    "section_id": "user_query",
+                    "query": direct_query,
+                    "source_preference": "hybrid",
+                    "reason": "围绕用户原始问题生成的直接检索词",
+                }
+            )
     if not plan:
         plan.append({"section_id": "sec_1", "query": query, "source_preference": "hybrid", "reason": "fallback"})
     deduped = _dedupe_sources(plan, ["query"])
@@ -294,6 +344,8 @@ def _build_queries(state: ResearchState, source_preference: str) -> list[dict]:
     
     # Check if we are in re-search iteration
     iteration = state.get("iteration", 0)
+    # 补搜轮次控制查询数量：首轮 4 条，补搜轮 3 条（减少等待时间）
+    limit = 3 if iteration > 0 else 4
     if iteration > 0 and state.get("supplementary_queries"):
         base_plan = state.get("supplementary_queries", [])
     else:
@@ -309,7 +361,7 @@ def _build_queries(state: ResearchState, source_preference: str) -> list[dict]:
                 queries.append(item)
     if not queries:
         queries.append({"section_id": "sec_1", "query": state["query"], "source_preference": source_preference, "reason": "fallback"})
-    return queries[:4]
+    return queries[:limit]
 
 
 def _extract_query_terms(query: str) -> list[str]:
@@ -387,7 +439,7 @@ def _filter_local_records(query: str, records: list[dict]) -> tuple[list[dict], 
 def _trim_evidence_for_llm(evidence: list[dict]) -> list[dict]:
     """压缩证据记录，只保留 LLM 需要的关键字段，减少 prompt token。"""
     trimmed = []
-    for item in (evidence or []):
+    for item in (evidence or [])[:30]:
         if not isinstance(item, dict):
             continue
         trimmed.append({
@@ -406,7 +458,7 @@ def _format_raw_records(records: list[dict], source_type: str) -> str:
     if not records:
         return "[]"
     lines = []
-    for record in records[:30]:  # 限制 30 条，减少 prompt token
+    for record in records[:20]:  # 限制 20 条，减少 prompt token
         locator = record.get("url") or record.get("doc_id") or ""
         lines.append(
             json.dumps(
@@ -415,7 +467,7 @@ def _format_raw_records(records: list[dict], source_type: str) -> str:
                     "title": record.get("title"),
                     "url": record.get("url", ""),
                     "doc_id": record.get("doc_id", ""),
-                    "snippet": str(record.get("snippet", ""))[:200],  # 截断到 200 字
+                    "snippet": str(record.get("snippet", ""))[:160],  # 截断到 160 字
                     "source_type": source_type,
                 },
                 ensure_ascii=False,
@@ -794,13 +846,18 @@ def intent_node(state: ResearchState, agent, agent_name: str) -> ResearchState:
         logger.info("%s 路由 (规则直判): %s", colorize("[intent]", "green"), rule_route)
         return {"intent": "multiagent", "draft": "", "messages": []}
 
+    # 问候/极短句直接走快速应答，跳过 LLM 二次确认（再省一次调用）
+    if rule_route == "direct" and _is_greeting_query(state["query"]):
+        logger.info("%s 路由 (问候直判): %s", colorize("[intent]", "green"), "direct")
+        return {"intent": "direct", "draft": "", "messages": []}
+
     # 只有规则判定为 direct 时才用 LLM 二次确认（避免误判简单问题）
     prompt = (
         f"用户问题：{state['query']}\n"
         f"规则引擎初判：{rule_route}\n"
         "请输出 JSON：{\"route\":\"direct|multiagent\",\"reason\":\"...\"}"
     )
-    payload, content, messages = _invoke_json_agent(
+    payload, content, messages, usage = _invoke_json_agent(
         state,
         prompt,
         agent,
@@ -812,16 +869,19 @@ def intent_node(state: ResearchState, agent, agent_name: str) -> ResearchState:
     if route not in {"direct", "multiagent"}:
         route = rule_route
     logger.info("%s 路由: %s", colorize("[intent]", "green"), route)
-    return {"intent": route, "draft": content, "messages": messages}
+    return {"intent": route, "draft": content, "messages": messages, "usage_log": [usage]}
 
 
 def direct_answer_node(state: ResearchState, agent, agent_name: str) -> ResearchState:
     logger.info("%s 开始 | agent=%s", colorize("[direct_answer]", "cyan"), colorize(agent_name, "magenta"))
     prompt = f"用户问题：{state['query']}"
     human = HumanMessage(content=with_memory_context(state, prompt))
+    t0 = time.time()
     result = agent.invoke({"messages": [human]})
+    elapsed = time.time() - t0
     content = _last_content(result).strip()
     emit("direct_answer", content)
+    usage = _make_usage("direct_answer", agent_name, prompt, content, elapsed)
     return {
         "intent": "direct",
         "final": content,
@@ -829,6 +889,7 @@ def direct_answer_node(state: ResearchState, agent, agent_name: str) -> Research
         "analysis_summary": content,
         "needs_more_research": False,
         "messages": [human, result["messages"][-1]],
+        "usage_log": [usage],
     }
 
 
@@ -836,15 +897,19 @@ def plan_node(state: ResearchState, agent, agent_name: str) -> ResearchState:
     logger.info("%s 开始 | agent=%s", colorize("[plan]", "cyan"), colorize(agent_name, "magenta"))
     log_inputs("plan", agent_name, {"query": state["query"]})
     fallback = _default_plan(state)
-    payload, content, messages = _invoke_json_agent(
+    payload, content, messages, usage = _invoke_json_agent(
         state,
-        f"用户需求：{state['query']}\n请先做大纲与问题拆解，再输出规划 JSON。",
+        f"用户需求：{state['query']}\n"
+        "请先做大纲与问题拆解，再输出规划 JSON。\n"
+        "输出约束：outline 最多 5 个章节，每个章节 search_queries 最多 2 条；"
+        "sub_questions 最多 6 条；research_questions 最多 6 条；budget.max_sources 不超过 12。",
         agent,
         agent_name,
         "plan",
         fallback,
     )
     outline = payload.get("outline") if isinstance(payload.get("outline"), list) else fallback["outline"]
+    outline = outline[:5]
     sub_questions = payload.get("sub_questions") if isinstance(payload.get("sub_questions"), list) else fallback["sub_questions"]
     research_questions = payload.get("research_questions") if isinstance(payload.get("research_questions"), list) else fallback["research_questions"]
     budget = payload.get("budget") if isinstance(payload.get("budget"), dict) else fallback["budget"]
@@ -861,7 +926,35 @@ def plan_node(state: ResearchState, agent, agent_name: str) -> ResearchState:
         "messages": messages,
         "draft": content,
         "iteration": 0,
+        "usage_log": [usage],
     }
+
+
+def _build_evidence_from_records(records: list[dict], default_source_type: str) -> list[dict]:
+    """程序化证据构建：无需 LLM 整理，直接由清洗后的记录生成 evidence。"""
+    evidence = []
+    for record in records:
+        if not isinstance(record, dict):
+            continue
+        domain = str(record.get("domain", ""))
+        item = {
+            "source_id": record.get("source_id"),
+            "title": record.get("title", ""),
+            "url": record.get("url", ""),
+            "snippet": str(record.get("snippet", ""))[:300],
+            "domain": domain,
+            "source_type": record.get("source_type") or default_source_type,
+            "reliability_hint": (
+                "official" if _is_official_domain(domain)
+                else record.get("reliability_hint", "unknown")
+            ),
+            "supports": [],
+            "notes": "",
+        }
+        if record.get("data_type"):
+            item["data_type"] = record.get("data_type")
+        evidence.append(item)
+    return evidence
 
 
 def web_search_node(state: ResearchState, agent, agent_name: str) -> ResearchState:
@@ -877,6 +970,13 @@ def web_search_node(state: ResearchState, agent, agent_name: str) -> ResearchSta
     logger.info("[web_search_node] 迭代信息 | iteration=%s | prefix=%s", iteration, prefix)
 
     # 并行执行所有搜索查询（ThreadPoolExecutor，减少网络 I/O 等待）
+    plan_context = json.dumps(
+        {
+            "search_plan": state.get("search_plan", []),
+            "sub_questions": state.get("sub_questions", []),
+        },
+        ensure_ascii=False,
+    )
     def _search_one(item_with_index):
         idx, item = item_with_index
         query_text = str(item.get("query", ""))
@@ -894,7 +994,10 @@ def web_search_node(state: ResearchState, agent, agent_name: str) -> ResearchSta
         }
 
     indexed_queries = list(enumerate(queries, 1))
-    with ThreadPoolExecutor(max_workers=min(len(indexed_queries), 4)) as pool:
+    finance_future = None
+    with ThreadPoolExecutor(max_workers=min(len(indexed_queries) + 1, 5)) as pool:
+        # 金融数据采集与网页搜索同时启动，互不阻塞
+        finance_future = pool.submit(collect_finance_data_records, state["query"], plan_context)
         futures = {pool.submit(_search_one, iq): iq for iq in indexed_queries}
         for future in as_completed(futures):
             try:
@@ -912,11 +1015,16 @@ def web_search_node(state: ResearchState, agent, agent_name: str) -> ResearchSta
                 })
             except Exception as exc:
                 logger.warning("[web_search_node] 查询失败: %s", exc)
+        try:
+            finance_records = finance_future.result() if finance_future else []
+        except Exception as exc:
+            logger.warning("[web_search_node] 金融数据采集失败: %s", exc)
+            finance_records = []
+
     raw_records = _dedupe_sources(raw_records, ["url", "title"])
     raw_records = _minimal_record_filter(raw_records, ["title", "snippet", "url"])
 
     # ── 注入 AKShare 金融数据 ──
-    finance_records = collect_finance_data_records(state["query"])
     if finance_records and "error" not in (finance_records[0] if finance_records else {}):
         logger.info("[web_search_node] 金融数据采集 | 记录数=%s", len(finance_records))
         # 为金融数据记录补充 source_id 前缀（避免与 Bocha 冲突）
@@ -937,14 +1045,24 @@ def web_search_node(state: ResearchState, agent, agent_name: str) -> ResearchSta
     elif finance_records and "error" in (finance_records[0] if finance_records else {}):
         logger.info("[web_search_node] 金融数据采集失败: %s", finance_records[0].get("error"))
 
-    logger.info("[web_search_node] 数据清洗后 | 去重过滤后记录数=%s", len(raw_records))
+    # ── 程序化筛选：网页记录做相关性过滤，金融数据直接保留 ──
+    web_records = [r for r in raw_records if r.get("source_type") != "finance_data"]
+    finance_kept = [r for r in raw_records if r.get("source_type") == "finance_data"]
+    web_kept, _filter_stats = _filter_web_records(state["query"], web_records)
+    # 预算约束：按 plan 阶段声明的 max_sources 限制证据数量（默认 30，上限 30）
+    try:
+        max_sources = max(5, min(int(state.get("budget", {}).get("max_sources", 30) or 30), 30))
+    except (TypeError, ValueError):
+        max_sources = 30
+    filtered = (web_kept + finance_kept)[:max_sources]
+    logger.info("[web_search_node] 数据清洗后 | 原始=%s | 保留=%s", len(raw_records), len(filtered))
 
     web_retrieval_stats = state.get("web_retrieval_stats", {})
     web_retrieval_stats["query_count"] = web_retrieval_stats.get("query_count", 0) + len(queries)
-    web_retrieval_stats["raw_count"] = web_retrieval_stats.get("raw_count", 0) + len(raw_records)
+    web_retrieval_stats["raw_count"] = web_retrieval_stats.get("raw_count", 0) + len(filtered)
 
-    log_inputs("web_search", agent_name, {"query_count": str(len(queries)), "raw_count": str(len(raw_records))})
-    if not raw_records:
+    log_inputs("web_search", agent_name, {"query_count": str(len(queries)), "raw_count": str(len(filtered))})
+    if not filtered:
         logger.warning("[web_search_node] 无可用证据，跳过网页上下文注入 | 查询数=%s", len(queries))
         logger.info("%s 无可用证据，跳过网页上下文注入", colorize("[web_search]", "yellow"))
         return {
@@ -953,50 +1071,63 @@ def web_search_node(state: ResearchState, agent, agent_name: str) -> ResearchSta
             "web_retrieval_stats": web_retrieval_stats,
             "web_search_trace": query_traces,
         }
-    logger.info("[web_search_node] 调用 LLM 整理证据 | raw_records=%s", len(raw_records))
-    fallback = _fallback_web_evidence(raw_records)
-    payload, content, messages = _invoke_json_agent(
-        state,
-        "请基于以下网页证据整理结构化 JSON。\n"
-        f"原问题：{state['query']}\n"
-        f"子问题：{json.dumps(state.get('sub_questions', []), ensure_ascii=False)}\n"
-        f"原始网页证据：\n{_format_raw_records(raw_records, 'web')}",
-        agent,
-        agent_name,
-        "web_search",
-        fallback,
-    )
-    evidence = (
-        payload.get("evidence")
-        if isinstance(payload.get("evidence"), list) and len(payload.get("evidence")) > 0
-        else fallback["evidence"]
-    )
-    logger.info("[web_search_node] LLM 返回证据 | evidence数量=%s | 来源=%s",
-                len(evidence), "LLM" if isinstance(payload.get("evidence"), list) and len(payload.get("evidence")) > 0 else "fallback")
-    allowed_source_ids = {str(item.get("source_id")) for item in raw_records if item.get("source_id")}
-    evidence = _prune_evidence_to_allowed_sources(evidence, allowed_source_ids)
-    # 从原始记录补充 LLM 可能丢失的 url/domain/title 字段
-    evidence = _enrich_evidence_from_raw(evidence, raw_records)
-    
+
+    # ── 默认跳过 LLM 整理（省一次 LLM 调用，约 30-45s）；设置 LLM_EVIDENCE=true 可恢复 ──
+    use_llm_evidence = os.getenv("LLM_EVIDENCE", "").strip().lower() in {"1", "true", "yes"}
+    if use_llm_evidence:
+        logger.info("[web_search_node] 调用 LLM 整理证据 | records=%s", len(filtered))
+        fallback = _fallback_web_evidence(filtered)
+        payload, content, messages, usage = _invoke_json_agent(
+            state,
+            "请基于以下网页证据整理结构化 JSON。\n"
+            f"原问题：{state['query']}\n"
+            f"子问题：{json.dumps(state.get('sub_questions', []), ensure_ascii=False)}\n"
+            f"原始网页证据：\n{_format_raw_records(filtered, 'web')}",
+            agent,
+            agent_name,
+            "web_search",
+            fallback,
+        )
+        evidence = (
+            payload.get("evidence")
+            if isinstance(payload.get("evidence"), list) and len(payload.get("evidence")) > 0
+            else fallback["evidence"]
+        )
+        allowed_source_ids = {str(item.get("source_id")) for item in filtered if item.get("source_id")}
+        evidence = _prune_evidence_to_allowed_sources(evidence, allowed_source_ids)
+        rejected_ids = payload.get("rejected_source_ids", [])
+        reject_reason = str(payload.get("reject_reason", "")).strip()
+        web_search_summary = payload.get("summary", content)
+    else:
+        evidence = _build_evidence_from_records(filtered, "web")
+        rejected_ids = []
+        reject_reason = ""
+        web_search_summary = f"完成证据采集与筛选，保留 {len(evidence)} 条记录。"
+        messages = []
+
+    # 从原始记录补充缺失的 url/domain/title 字段
+    evidence = _enrich_evidence_from_raw(evidence, filtered)
+
     web_retrieval_stats["kept_count"] = web_retrieval_stats.get("kept_count", 0) + len(evidence)
-    web_retrieval_stats["dropped_count"] = web_retrieval_stats.get("dropped_count", 0) + max(len(raw_records) - len(evidence), 0)
-    
+    web_retrieval_stats["dropped_count"] = web_retrieval_stats.get("dropped_count", 0) + max(len(filtered) - len(evidence), 0)
+
     kept_ids = {str(item.get("source_id")) for item in evidence if item.get("source_id")}
     query_traces = _finalize_query_traces(
         query_traces,
         kept_ids,
-        payload.get("rejected_source_ids", []),
-        str(payload.get("reject_reason", "")).strip(),
+        rejected_ids,
+        reject_reason,
     )
-    
+
     existing_evidence = state.get("web_evidence", [])
     logger.info("[web_search_node] 节点完成 | 新增证据=%s | 累计证据=%s", len(evidence), len(existing_evidence) + len(evidence))
     return {
-        "web_search": payload.get("summary", content),
+        "web_search": web_search_summary,
         "web_evidence": existing_evidence + evidence,
         "web_retrieval_stats": web_retrieval_stats,
         "web_search_trace": query_traces,
         "messages": messages,
+        "usage_log": [usage] if use_llm_evidence else [],
     }
 
 
@@ -1045,7 +1176,7 @@ def local_rag_node(state: ResearchState, agent, agent_name: str) -> ResearchStat
             "local_rag_trace": query_traces,
         }
     fallback = _fallback_local_evidence(raw_records)
-    payload, content, messages = _invoke_json_agent(
+    payload, content, messages, usage = _invoke_json_agent(
         state,
         "请基于以下知识库证据整理结构化 JSON。\n"
         f"原问题：{state['query']}\n"
@@ -1082,20 +1213,39 @@ def local_rag_node(state: ResearchState, agent, agent_name: str) -> ResearchStat
         "local_retrieval_stats": local_retrieval_stats,
         "local_rag_trace": query_traces,
         "messages": messages,
+        "usage_log": [usage],
     }
 
 
 def deep_dive_node(state: ResearchState, agent, agent_name: str) -> ResearchState:
-    logger.info("%s 开始（程序化评分，跳过 LLM 调用） | agent=%s", colorize("[deep_dive]", "cyan"), colorize(agent_name, "magenta"))
+    use_llm_judge = os.getenv("LLM_EVIDENCE_JUDGE", "").strip().lower() in {"1", "true", "yes"}
+    judge_mode = "LLM 交叉验证" if use_llm_judge else "程序化评分"
+    logger.info("%s 开始（%s） | agent=%s", colorize("[deep_dive]", "cyan"), judge_mode, colorize(agent_name, "magenta"))
     if not state.get("web_evidence") and not state.get("local_evidence"):
         logger.info("%s 等待检索结果", colorize("[deep_dive]", "yellow"))
         return {}
 
-    # 直接使用程序化评分，省去一次 LLM 调用（~4-8s）
-    # _fallback_audit 已包含：可靠性评分、去重、低置信度标记、来源索引
     fallback = _fallback_audit(state)
     evidence_pool = fallback["evidence_pool"]
     audit_flags = fallback["audit_flags"]
+
+    # 默认程序化评分（省一次 LLM 调用）；设置 LLM_EVIDENCE_JUDGE=true 时改用 LLM 交叉验证
+    if use_llm_judge:
+        payload, _, _, usage = _invoke_json_agent(
+            state,
+            "请基于以下检索证据完成证据评分、去重、冲突审计与来源索引，并输出结构化 JSON：\n"
+            f"原问题：{state['query']}\n"
+            f"网页证据：{json.dumps(_trim_evidence_for_llm(state.get('web_evidence', [])), ensure_ascii=False)}\n"
+            f"本地证据：{json.dumps(_trim_evidence_for_llm(state.get('local_evidence', [])), ensure_ascii=False)}",
+            agent,
+            agent_name,
+            "deep_dive",
+            fallback,
+        )
+        if isinstance(payload.get("evidence_pool"), list) and payload["evidence_pool"]:
+            evidence_pool = payload["evidence_pool"]
+        if isinstance(payload.get("audit_flags"), list) and payload["audit_flags"]:
+            audit_flags = payload["audit_flags"]
 
     # 补全 raw_evidence 中可能未被覆盖的记录
     raw_evidence = state.get("web_evidence", []) + state.get("local_evidence", [])
@@ -1144,6 +1294,7 @@ def deep_dive_node(state: ResearchState, agent, agent_name: str) -> ResearchStat
         "audit_flags": audit_flags,
         "source_index": source_index,
         "messages": [],
+        "usage_log": [usage] if use_llm_judge else [],
     }
 
 
@@ -1160,7 +1311,7 @@ def _fallback_analysis(state: ResearchState) -> dict:
 def analyze_node(state: ResearchState, agent, agent_name: str) -> ResearchState:
     logger.info("%s 开始 | agent=%s", colorize("[analyze]", "cyan"), colorize(agent_name, "magenta"))
     fallback = _fallback_analysis(state)
-    payload, content, messages = _invoke_json_agent(
+    payload, content, messages, usage = _invoke_json_agent(
         state,
         "请基于证据池输出结论映射 JSON，并评估证据完备性：\n"
         f"原问题：{state['query']}\n"
@@ -1184,6 +1335,7 @@ def analyze_node(state: ResearchState, agent, agent_name: str) -> ResearchState:
         "needs_more_research": needs_more_research,
         "missing_gaps": missing_gaps,
         "messages": messages,
+        "usage_log": [usage],
     }
 
 def reflect_node(state: ResearchState, agent, agent_name: str) -> ResearchState:
@@ -1206,7 +1358,7 @@ def reflect_node(state: ResearchState, agent, agent_name: str) -> ResearchState:
         "请生成新的补搜计划以填补缺口。"
     )
     
-    payload, content, messages = _invoke_json_agent(
+    payload, content, messages, usage = _invoke_json_agent(
         state,
         prompt,
         agent,
@@ -1219,34 +1371,68 @@ def reflect_node(state: ResearchState, agent, agent_name: str) -> ResearchState:
         "iteration": state.get("iteration", 0) + 1,
         "supplementary_queries": payload.get("supplementary_queries", fallback["supplementary_queries"]),
         "messages": messages,
+        "usage_log": [usage],
     }
+
+
+def _quality_check(state: ResearchState, content: str) -> dict:
+    """程序化报告质量自检：按研究域动态检查，而不是把金融规则写死。"""
+    domain = resolve_research_domain(state.get("research_domain", "auto"), state.get("query", ""))
+    required_sections = ["投资摘要", "宏观", "行业", "公司", "估值", "风险"] if domain == "finance" else ["结论", "背景", "方案", "对比", "风险"]
+    section_hits = sum(1 for section in required_sections if section in content)
+    cited = _extract_citation_ids(content)
+    dimensions = {str(item.get("dimension", "")) for item in (state.get("findings") or []) if item.get("dimension")}
+    claims_with_sources = sum(1 for item in (state.get("findings") or []) if item.get("source_ids"))
+    findings_count = len(state.get("findings") or [])
+    checks = [
+        {"name": "结构完整性", "passed": section_hits >= (4 if domain == "finance" else 3), "detail": f"关键章节覆盖 {section_hits}/{len(required_sections)}"},
+        {"name": "引用溯源", "passed": len(cited) > 0, "detail": f"正文引用 {len(cited)} 条"},
+        {"name": "篇幅控制", "passed": 800 <= len(content) <= 4000, "detail": f"{len(content)} 字"},
+        {"name": "结论可追溯", "passed": findings_count == 0 or claims_with_sources == findings_count, "detail": f"有来源结论 {claims_with_sources}/{findings_count}"},
+    ]
+    passed = sum(1 for check in checks if check["passed"])
+    return {"score": round(passed / len(checks) * 100), "checks": checks}
+
 
 def write_node(state: ResearchState, agent, agent_name: str) -> ResearchState:
     logger.info("%s 开始 | agent=%s", colorize("[write]", "cyan"), colorize(agent_name, "magenta"))
     valid_source_ids = [str(item.get("source_id", "")).strip() for item in state.get("source_index", []) if item.get("source_id")]
     valid_source_ids = [item for item in valid_source_ids if item][:80]
     valid_source_ids_set = set(valid_source_ids)
+
+    # 裁剪 prompt 中的大块 JSON，控制输入 token 量，缩短首 token 等待
+    findings = (state.get("findings") or [])[:30]
+    source_index = (state.get("source_index") or [])[:50]
+    audit_flags = (state.get("audit_flags") or [])[:20]
+    sub_questions = (state.get("sub_questions") or [])[:8]
+    claim_map = (state.get("claim_map") or [])[:20]
     
     prompt = (
         "请严格根据以下信息撰写最终的 Markdown 研报。请直接输出正文，绝对不要输出任何 JSON 结构，也不要复述你的指令。\n\n"
         f"核心问题：{state['query']}\n"
-        f"子问题拆解：{json.dumps(state.get('sub_questions', []), ensure_ascii=False)}\n\n"
+        f"子问题拆解：{json.dumps(sub_questions, ensure_ascii=False)}\n\n"
         "【分析结论 (Findings)】：\n"
-        f"{json.dumps(state.get('findings', []), ensure_ascii=False)}\n\n"
+        f"{json.dumps(findings, ensure_ascii=False)}\n\n"
+        "【结论与来源映射 (claim_map)】：\n"
+        f"{json.dumps(claim_map, ensure_ascii=False)}\n\n"
         "【可用来源索引 (source_index)】：\n"
-        f"{json.dumps(state.get('source_index', []), ensure_ascii=False)}\n\n"
+        f"{json.dumps(source_index, ensure_ascii=False)}\n\n"
         "【合法引用ID列表】：\n"
         f"{json.dumps(valid_source_ids, ensure_ascii=False)}\n\n"
         "【可能存在的风险/冲突 (Audit Flags)】：\n"
-        f"{json.dumps(state.get('audit_flags', []), ensure_ascii=False)}\n\n"
+        f"{json.dumps(audit_flags, ensure_ascii=False)}\n\n"
+        "【篇幅要求】：全文控制在 1500-2000 字以内，精炼为主。\n\n"
         "要求：正文必须使用合法引用ID（例如 [WEB1_1-1]、[LOC1_1-3]）；禁止使用不存在的编号。"
         "结尾不需要你来列举引用列表，系统会自动拼接。"
     )
     human = HumanMessage(content=with_memory_context(state, prompt))
     
     # 彻底断开之前的 messages 累积，只给模型当前这一条指令，避免被前面的 JSON 带偏
+    t0 = time.time()
     result = agent.invoke({"messages": [human]})
+    elapsed = time.time() - t0
     content = _last_content(result)
+    usage = _make_usage("write", agent_name, prompt, content, elapsed)
     
     # 强制清理可能的错误 JSON 代码块
     content = re.sub(r"^```json\s*", "", content)
@@ -1256,7 +1442,57 @@ def write_node(state: ResearchState, agent, agent_name: str) -> ResearchState:
     
     # 校验并修正引用ID，移除非法引用
     content, used_citation_ids = _validate_and_fix_citations(content, valid_source_ids_set)
-    
+
+    # 报告时效与免责声明
+    generated_at = datetime.now().strftime("%Y-%m-%d %H:%M")
+    domain = resolve_research_domain(state.get("research_domain", "auto"), state.get("query", ""))
+    disclaimer_text = "本报告基于公开网页、金融数据和本地知识库整理，不构成投资建议。" if domain == "finance" else "本报告基于公开网页和本地知识库整理，关键结论请结合原始来源复核。"
+    disclaimer = f"> 生成时间：{generated_at} ｜ 研究域：{domain} ｜ {disclaimer_text}\n\n"
+
     final_content = _ensure_reference_section(content, state)
+    final_content = disclaimer + final_content
+    quality_report = _quality_check(state, final_content)
     emit("write", final_content)
-    return {"draft": final_content, "final": final_content, "messages": [human, result["messages"][-1]]}
+    return {
+        "draft": final_content,
+        "final": final_content,
+        "messages": [human, result["messages"][-1]],
+        "usage_log": [usage],
+        "quality_report": quality_report,
+    }
+
+
+def judge_node(state: ResearchState, agent, agent_name: str) -> ResearchState:
+    """LLM-as-Judge：对最终报告做第二轮质量评审，叠加在规则自检之上。"""
+    logger.info("%s 开始（LLM-as-Judge） | agent=%s", colorize("[judge]", "cyan"), colorize(agent_name, "magenta"))
+    rule_quality = state.get("quality_report", {}) or {}
+    fallback = {
+        "score": rule_quality.get("score", 0),
+        "summary": "规则自检分（LLM 评审未返回有效结果）",
+        "issues": [],
+    }
+    prompt = (
+        "请评审以下研报质量，并输出 JSON：\n"
+        f"用户问题：{state['query']}\n"
+        f"规则自检结果：{json.dumps(rule_quality, ensure_ascii=False)}\n"
+        f"研报正文：\n{state.get('final', '')[:6000]}"
+    )
+    payload, _, messages, usage = _invoke_json_agent(
+        state,
+        prompt,
+        agent,
+        agent_name,
+        "judge",
+        fallback,
+    )
+    try:
+        llm_score = int(payload.get("score", fallback["score"]))
+    except (TypeError, ValueError):
+        llm_score = int(fallback["score"])
+    llm_score = max(0, min(llm_score, 100))
+    quality = dict(rule_quality)
+    quality["llm_score"] = llm_score
+    quality["llm_summary"] = str(payload.get("summary", "") or "")
+    issues = payload.get("issues", [])
+    quality["llm_issues"] = issues if isinstance(issues, list) else []
+    return {"quality_report": quality, "messages": messages, "usage_log": [usage]}

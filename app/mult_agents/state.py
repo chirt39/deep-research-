@@ -8,6 +8,7 @@ from langchain_core.messages import BaseMessage
 
 class ResearchState(TypedDict):
     query: str
+    research_domain: str
     user_id: str
     tenant_id: str
     memory_context: str
@@ -44,6 +45,8 @@ class ResearchState(TypedDict):
     final: str
     iteration: int
     max_iterations: int
+    usage_log: Annotated[list[dict], operator.add]
+    quality_report: dict
 
 
 def create_initial_state(
@@ -52,9 +55,11 @@ def create_initial_state(
     user_id: str,
     tenant_id: str,
     memory_context: str = "",
+    research_domain: str = "auto",
 ) -> ResearchState:
     return {
         "query": query,
+        "research_domain": research_domain,
         "user_id": user_id,
         "tenant_id": tenant_id,
         "memory_context": memory_context,
@@ -91,4 +96,6 @@ def create_initial_state(
         "final": "",
         "iteration": 0,
         "max_iterations": max_iterations,
+        "usage_log": [],
+        "quality_report": {},
     }

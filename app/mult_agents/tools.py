@@ -1,5 +1,6 @@
 """工具模块：封装 Web 检索、本地 RAG 查询与金融数据采集。"""
 
+import copy
 import json
 import logging
 import os
@@ -15,10 +16,26 @@ logger = logging.getLogger("mult_agents")
 
 # 全局 RAG 系统实例
 _RAG_SYSTEM: Optional[RAGSystem] = None
+_RAG_CONFIG: Optional[RAGConfig] = None
 
 # 搜索缓存（避免短时间内重复搜索同一 query）
 _SEARCH_CACHE: dict[str, tuple[float, list[dict]]] = {}
 _SEARCH_CACHE_TTL = 300  # 5 分钟缓存
+_CACHE_MAX_ENTRIES = 128
+
+
+def _cache_put(cache: dict, key: str, value: list[dict]) -> None:
+    """写入带容量上限的 TTL 缓存（超限时按插入顺序淘汰最旧条目）。"""
+    cache[key] = (time.time(), value)
+    while len(cache) > _CACHE_MAX_ENTRIES:
+        cache.pop(next(iter(cache)))
+
+
+def register_rag_config(config: Optional[RAGConfig] = None):
+    """注册 RAG 配置（不立即初始化，首次检索时才懒加载）。"""
+    global _RAG_CONFIG
+    _RAG_CONFIG = config
+
 
 def init_rag_system(config: Optional[RAGConfig] = None):
     """初始化全局 RAG 系统"""
@@ -30,7 +47,15 @@ def init_rag_system(config: Optional[RAGConfig] = None):
             print(f"RAG 系统初始化失败: {e}")
 
 
+def _ensure_rag_initialized():
+    """首次检索时懒加载 RAG（避免 Milvus 未启用时也加载嵌入模型）。"""
+    global _RAG_SYSTEM
+    if _RAG_SYSTEM is None and _RAG_CONFIG is not None:
+        init_rag_system(_RAG_CONFIG)
+
+
 def search_knowledge_base_records(query: str, limit: int = 5) -> list[dict]:
+    _ensure_rag_initialized()
     if _RAG_SYSTEM is None:
         return []
     try:
@@ -44,7 +69,8 @@ def _duckduckgo_search_records(query: str, count: int = 8) -> list[dict]:
     records: list[dict] = []
     try:
         from ddgs import DDGS
-        with DDGS(timeout=15) as ddgs:
+        # 8s 超时：避免 Yahoo/Bing 等慢引擎逐个拖满 15s
+        with DDGS(timeout=8) as ddgs:
             results = list(ddgs.text(query, max_results=count))
         for idx, r in enumerate(results, 1):
             records.append({
@@ -87,7 +113,7 @@ def bocha_web_search_records(query: str, count: int = 8) -> list[dict]:
         # Bocha 没配 → 降级到免费的 DuckDuckGo
         logger.info("[web_search] BOCHA_API_KEY 未配置，使用 DuckDuckGo 免费搜索")
         records = _duckduckgo_search_records(query, count)
-        _SEARCH_CACHE[cache_key] = (time.time(), records)
+        _cache_put(_SEARCH_CACHE, cache_key, records)
         return records
     payload = {
         "query": query,
@@ -161,13 +187,17 @@ def bocha_web_search_records(query: str, count: int = 8) -> list[dict]:
     logger.info("[bocha_web_search] 搜索完成 | 返回记录数=%s", len(records))
     # 写入缓存
     cache_key = f"{query[:80]}:{count}"
-    _SEARCH_CACHE[cache_key] = (time.time(), records)
+    _cache_put(_SEARCH_CACHE, cache_key, records)
     return records
 
 
 # ═══════════════════════════════════════════════════════════════════
 # AKShare 金融数据工具（免费，无需 API Key）
 # ═══════════════════════════════════════════════════════════════════
+
+# 金融数据缓存（AKShare 接口较慢，短时间内重复查询直接命中）
+_FINANCE_CACHE: dict[str, tuple[float, list[dict]]] = {}
+_FINANCE_CACHE_TTL = 600  # 10 分钟
 
 _AKSHARE_AVAILABLE = False
 try:
@@ -209,7 +239,168 @@ def _detect_stock_code(query: str) -> str | None:
     match = re.search(r'(?<!\d)(\d{6})(?!\d)', query)
     if match:
         return _normalize_stock_code(match.group(1))
-    # 匹配常见股票简称？暂不实现，由 LLM 在 plan 阶段提取
+    return None
+
+
+# ── 常见 A 股公司名 → 代码映射（解决"只写公司名"拿不到数据的问题） ──
+
+_STOCK_NAME_TO_CODE: dict[str, str] = {
+    "比亚迪": "002594",
+    "宁德时代": "300750",
+    "宁德": "300750",
+    "贵州茅台": "600519",
+    "茅台": "600519",
+    "五粮液": "000858",
+    "中国平安": "601318",
+    "平安": "601318",
+    "招商银行": "600036",
+    "招行": "600036",
+    "工商银行": "601398",
+    "农业银行": "601288",
+    "中国银行": "601988",
+    "建设银行": "601939",
+    "交通银行": "601328",
+    "中信证券": "600030",
+    "东方财富": "300059",
+    "恒瑞医药": "600276",
+    "药明康德": "603259",
+    "迈瑞医疗": "300760",
+    "隆基绿能": "601012",
+    "通威股份": "600438",
+    "阳光电源": "300274",
+    "京东方": "000725",
+    "立讯精密": "002475",
+    "歌尔股份": "002241",
+    "海康威视": "002415",
+    "美的集团": "000333",
+    "美的": "000333",
+    "格力电器": "000651",
+    "格力": "000651",
+    "海尔智家": "600690",
+    "万科": "000002",
+    "保利发展": "600048",
+    "中国中免": "601888",
+    "伊利股份": "600887",
+    "海天味业": "603288",
+    "长江电力": "600900",
+    "中国神华": "601088",
+    "紫金矿业": "601899",
+    "三一重工": "600031",
+    "中芯国际": "688981",
+    "韦尔股份": "603501",
+    "兆易创新": "603986",
+    "中兴通讯": "000063",
+    "工业富联": "601138",
+    "中远海控": "601919",
+    "顺丰控股": "002352",
+    "中国移动": "600941",
+    "中国电信": "601728",
+    "中国联通": "600050",
+    "京沪高铁": "601816",
+    "金山办公": "688111",
+    "科大讯飞": "002230",
+    "三六零": "601360",
+    "用友网络": "600588",
+    "恒生电子": "600570",
+    "中科创达": "300496",
+    "深信服": "300454",
+    "寒武纪": "688256",
+    "中际旭创": "300308",
+    "新易盛": "300502",
+    "天孚通信": "300394",
+    "赛力斯": "601127",
+    "长安汽车": "000625",
+    "长城汽车": "601633",
+    "上汽集团": "600104",
+    "广汽集团": "601238",
+    "中国石油": "601857",
+    "中国石化": "600028",
+    "中国海油": "600938",
+}
+
+
+def _detect_stock_code_from_name(query: str) -> str | None:
+    """从公司名称匹配 A 股代码（内置常用标的映射表）。"""
+    normalized = query.replace(" ", "")
+    for name, code in _STOCK_NAME_TO_CODE.items():
+        if name in normalized:
+            return _normalize_stock_code(code)
+    return None
+
+
+# ── 港股 / 美股代码识别（仅行情数据） ──
+
+_HK_NAME_TO_CODE: dict[str, str] = {
+    "腾讯控股": "00700",
+    "腾讯": "00700",
+    "美团": "03690",
+    "阿里巴巴": "09988",
+    "小米集团": "01810",
+    "小米": "01810",
+    "快手": "01024",
+    "京东集团": "09618",
+    "京东": "09618",
+    "网易": "09999",
+    "比亚迪股份": "01211",
+    "汇丰控股": "00005",
+    "香港交易所": "00388",
+    "港交所": "00388",
+    "友邦保险": "01299",
+}
+
+_US_NAME_TO_TICKER: dict[str, str] = {
+    "苹果": "AAPL",
+    "微软": "MSFT",
+    "谷歌": "GOOGL",
+    "亚马逊": "AMZN",
+    "英伟达": "NVDA",
+    "特斯拉": "TSLA",
+    "台积电": "TSM",
+    "Meta": "META",
+    "奈飞": "NFLX",
+    "英特尔": "INTC",
+    "高通": "QCOM",
+    "博通": "AVGO",
+    "迪士尼": "DIS",
+    "可口可乐": "KO",
+    "百事": "PEP",
+    "麦当劳": "MCD",
+    "沃尔玛": "WMT",
+    "波音": "BA",
+    "甲骨文": "ORCL",
+    "拼多多": "PDD",
+    "百度": "BIDU",
+    "蔚来": "NIO",
+    "理想": "LI",
+    "小鹏": "XPEV",
+}
+
+
+def _detect_hk_code(query: str) -> str | None:
+    """识别港股：5 位数字代码或常见港股公司名。"""
+    import re
+    match = re.search(r'(?<!\d)(\d{5})(?!\d)', query)
+    if match:
+        return match.group(1)
+    for name, code in _HK_NAME_TO_CODE.items():
+        if name in query:
+            return code
+    return None
+
+
+def _detect_us_ticker(query: str) -> str | None:
+    """识别美股：常见美股公司名，或「美股 + 大写代码」形式。"""
+    for name, ticker in _US_NAME_TO_TICKER.items():
+        if name in query:
+            return ticker
+    if "美股" not in query:
+        return None
+    import re
+    match = re.search(r'\b([A-Z]{1,5})\b', query)
+    if match:
+        ticker = match.group(1)
+        if ticker.lower() not in {"ai", "us", "etf", "ipo", "nasdaq"}:
+            return ticker
     return None
 
 
@@ -258,6 +449,76 @@ def fetch_stock_price_records(
     return records
 
 
+# ── 工具 1b: 港股 / 美股历史行情（仅行情，财务与新闻暂不覆盖） ──
+
+def fetch_hk_price_records(symbol: str, count: int = 12) -> list[dict]:
+    """获取港股历史行情（AKShare stock_hk_hist，免费）。"""
+    records: list[dict] = []
+    result, error = _safe_finance_call(
+        ak.stock_hk_hist,
+        symbol=symbol,
+        period="monthly",
+        adjust="qfq",
+    )
+    if error or result is None:
+        return [{"error": error}]
+    try:
+        for _, row in result.tail(count).iterrows():
+            date_str = str(row.get("日期", ""))
+            close_val = float(row.get("收盘", 0))
+            records.append({
+                "source_id": f"FIN-HK-{len(records)+1}",
+                "title": f"港股行情 {symbol} {date_str} 收盘{close_val:.2f}",
+                "snippet": (
+                    f"日期:{date_str} 开:{float(row.get('开盘',0)):.2f} "
+                    f"收:{close_val:.2f} 高:{float(row.get('最高',0)):.2f} "
+                    f"低:{float(row.get('最低',0)):.2f}"
+                ),
+                "url": "",
+                "date": date_str,
+                "source_type": "finance_data",
+                "data_type": "price_history",
+                "market": "hk",
+            })
+    except Exception as e:
+        return [{"error": f"港股行情解析失败: {e}"}]
+    return records
+
+
+def fetch_us_price_records(symbol: str, count: int = 12) -> list[dict]:
+    """获取美股历史行情（AKShare stock_us_hist，免费）。"""
+    records: list[dict] = []
+    result, error = _safe_finance_call(
+        ak.stock_us_hist,
+        symbol=symbol,
+        period="monthly",
+        adjust="qfq",
+    )
+    if error or result is None:
+        return [{"error": error}]
+    try:
+        for _, row in result.tail(count).iterrows():
+            date_str = str(row.get("日期", ""))
+            close_val = float(row.get("收盘", 0))
+            records.append({
+                "source_id": f"FIN-US-{len(records)+1}",
+                "title": f"美股行情 {symbol} {date_str} 收盘{close_val:.2f}",
+                "snippet": (
+                    f"日期:{date_str} 开:{float(row.get('开盘',0)):.2f} "
+                    f"收:{close_val:.2f} 高:{float(row.get('最高',0)):.2f} "
+                    f"低:{float(row.get('最低',0)):.2f}"
+                ),
+                "url": "",
+                "date": date_str,
+                "source_type": "finance_data",
+                "data_type": "price_history",
+                "market": "us",
+            })
+    except Exception as e:
+        return [{"error": f"美股行情解析失败: {e}"}]
+    return records
+
+
 # ── 工具 2: 个股信息查询（含 PE/PB/市值等估值指标） ──
 
 def fetch_stock_info_record(symbol: str) -> dict | None:
@@ -269,7 +530,9 @@ def fetch_stock_info_record(symbol: str) -> dict | None:
     Returns:
         个股信息 dict，失败时返回 None
     """
-    result, error = _safe_finance_call(ak.stock_individual_info_em, symbol=symbol)
+    # 东方财富接口需要 6 位纯数字代码，去掉 sz/sh 前缀
+    short_code = symbol[2:] if symbol.startswith(("sz", "sh")) else symbol
+    result, error = _safe_finance_call(ak.stock_individual_info_em, symbol=short_code)
     if error or result is None:
         logger.warning("[finance] 个股信息获取失败: %s", error)
         return None
@@ -375,7 +638,9 @@ def fetch_stock_news_records(stock_code: str, limit: int = 10) -> list[dict]:
     """获取个股新闻（东方财富来源，免费无需 API Key）。"""
     records: list[dict] = []
     code = _normalize_stock_code(stock_code)
-    result, error = _safe_finance_call(ak.stock_news_em, symbol=code)
+    # 东方财富接口需要 6 位纯数字代码，去掉 sz/sh 前缀
+    short_code = code[2:] if code.startswith(("sz", "sh")) else code
+    result, error = _safe_finance_call(ak.stock_news_em, symbol=short_code)
     if error or result is None:
         return [{"error": error}]
     try:
@@ -450,16 +715,55 @@ def fetch_macro_indicator_records(indicator: str) -> list[dict]:
 
 # ── 工具 6: 统一金融数据采集 ──
 
-def collect_finance_data_records(query: str) -> list[dict]:
+def collect_finance_data_records(query: str, context: str = "") -> list[dict]:
     """根据查询文本，自动采集相关金融数据并返回结构化记录列表。
 
     这是金融投研的主入口——从用户查询中提取股票代码，
     并行获取行情、财务指标、新闻，整合为统一的 evidence records。
+
+    Args:
+        query: 用户原始查询
+        context: 附加上下文（搜索计划 / 子问题），用于用户只写公司名、
+                 但搜索计划中包含 6 位代码时也能提取到股票代码。
     """
+    cache_key = f"query:{query.strip()[:100]}"
+    cached = _FINANCE_CACHE.get(cache_key)
+    if cached and time.time() - cached[0] < _FINANCE_CACHE_TTL:
+        logger.info("[finance] 缓存命中 | key=%s", cache_key)
+        return copy.deepcopy(cached[1])
+
     all_records: list[dict] = []
-    stock_code = _detect_stock_code(query)
+    stock_code = _detect_stock_code(f"{query} {context}".strip())
+    if not stock_code:
+        stock_code = _detect_stock_code_from_name(query)
 
     if not stock_code:
+        # ── 港股：仅历史行情（财务/新闻接口暂不覆盖） ──
+        hk_code = _detect_hk_code(query)
+        if hk_code:
+            logger.info("[finance] 检测到港股代码: %s", hk_code)
+            hk_records = fetch_hk_price_records(hk_code, count=12)
+            if hk_records and "error" not in (hk_records[0] if hk_records else {}):
+                for record in hk_records:
+                    record["domain"] = "eastmoney"
+                    record["reliability_hint"] = "data_provider"
+                all_records.extend(hk_records)
+            _cache_put(_FINANCE_CACHE, cache_key, all_records)
+            return all_records
+
+        # ── 美股：仅历史行情 ──
+        us_ticker = _detect_us_ticker(query)
+        if us_ticker:
+            logger.info("[finance] 检测到美股代码: %s", us_ticker)
+            us_records = fetch_us_price_records(us_ticker, count=12)
+            if us_records and "error" not in (us_records[0] if us_records else {}):
+                for record in us_records:
+                    record["domain"] = "yahoo"
+                    record["reliability_hint"] = "data_provider"
+                all_records.extend(us_records)
+            _cache_put(_FINANCE_CACHE, cache_key, all_records)
+            return all_records
+
         # 检查是否涉及宏观指标
         macro_keywords = {
             "cpi": "cpi", "CPI": "cpi", "通胀": "cpi", "物价": "cpi",
@@ -474,15 +778,17 @@ def collect_finance_data_records(query: str) -> list[dict]:
                 macro_records = fetch_macro_indicator_records(indicator)
                 all_records.extend(macro_records)
                 break
+        _cache_put(_FINANCE_CACHE, cache_key, all_records)
         return all_records
 
     logger.info("[finance] 检测到股票代码: %s", stock_code)
     short_code = stock_code[2:] if stock_code.startswith(("sz", "sh")) else stock_code
 
-    # 并行获取个股信息、财务指标、新闻（3 路并发，减少 I/O 等待）
+    # 并行获取个股信息、财务指标、新闻、历史行情（4 路并发，减少 I/O 等待）
     info = None
     fin_records = []
     news_records = []
+    price_records = []
 
     def _fetch_info():
         return fetch_stock_info_record(stock_code)
@@ -493,11 +799,15 @@ def collect_finance_data_records(query: str) -> list[dict]:
     def _fetch_news():
         return fetch_stock_news_records(stock_code, limit=8)
 
-    with ThreadPoolExecutor(max_workers=3) as pool:
+    def _fetch_prices():
+        return fetch_stock_price_records(stock_code, period="monthly", count=6)
+
+    with ThreadPoolExecutor(max_workers=4) as pool:
         future_info = pool.submit(_fetch_info)
         future_fin = pool.submit(_fetch_financials)
         future_news = pool.submit(_fetch_news)
-        for future in as_completed([future_info, future_fin, future_news]):
+        future_prices = pool.submit(_fetch_prices)
+        for future in as_completed([future_info, future_fin, future_news, future_prices]):
             try:
                 result = future.result()
                 if future == future_info:
@@ -506,6 +816,8 @@ def collect_finance_data_records(query: str) -> list[dict]:
                     fin_records = result
                 elif future == future_news:
                     news_records = result
+                elif future == future_prices:
+                    price_records = result
             except Exception as exc:
                 logger.warning("[finance] 并行获取金融数据失败: %s", exc)
 
@@ -541,5 +853,12 @@ def collect_finance_data_records(query: str) -> list[dict]:
             record["reliability_hint"] = "media"
         all_records.extend(news_records)
 
+    if price_records and "error" not in (price_records[0] if price_records else {}):
+        for record in price_records:
+            record["domain"] = "eastmoney"
+            record["reliability_hint"] = "data_provider"
+        all_records.extend(price_records)
+
     logger.info("[finance] 金融数据采集完成 | 总记录数=%s", len(all_records))
+    _cache_put(_FINANCE_CACHE, cache_key, all_records)
     return all_records

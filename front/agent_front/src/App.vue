@@ -1,17 +1,50 @@
 <script setup lang="ts">
-import { nextTick, ref } from 'vue'
+import { nextTick, onMounted, ref } from 'vue'
 
 type StreamEvent = {
   type: 'status' | 'phase' | 'route' | 'final' | 'error'
   message?: string
   final?: string
   node?: string
+  usage?: {
+    calls?: number
+    cost_yuan?: number
+    input_tokens?: number
+    output_tokens?: number
+  }
+  quality?: {
+    score?: number
+  }
+  report_id?: string
+  research_domain?: string
+  evidence_summary?: {
+    evidence_count?: number
+    source_count?: number
+    source_types?: string[]
+    avg_reliability?: number | null
+  }
+  trace?: string[]
 }
 
 type ChatMessage = {
   id: string
   role: 'user' | 'assistant' | 'status'
   content: string
+}
+
+type HistoryItem = {
+  id: string
+  query: string
+  thread_id: string
+  user_id: string
+  created_at: string
+  usage?: {
+    calls?: number
+    cost_yuan?: number
+  }
+  quality?: {
+    score?: number
+  }
 }
 
 const userId = ref('user01')
@@ -23,6 +56,18 @@ const errorMessage = ref('')
 const messageListRef = ref<HTMLElement | null>(null)
 const composerRef = ref<HTMLTextAreaElement | null>(null)
 const progressLogs = ref<string[]>([])
+const researchDomain = ref<'auto' | 'general' | 'finance'>('auto')
+const lastRunMeta = ref<{
+  calls: number
+  cost_yuan: number
+  quality?: number
+  report_id?: string
+  research_domain?: string
+  evidence_count?: number
+  source_count?: number
+  trace?: string[]
+} | null>(null)
+const history = ref<HistoryItem[]>([])
 const starterPrompts = [
   {
     title: '个股深度研究',
@@ -80,6 +125,17 @@ const escapeHtml = (value: string): string =>
     .replaceAll('"', '&quot;')
     .replaceAll("'", '&#39;')
 
+const renderTable = (rows: string[]): string => {
+  const cells = (row: string) => row.split('|').slice(1, -1).map((c) => c.trim())
+  const headerRow = rows[0] ?? ''
+  const head = cells(headerRow).map((c) => `<th>${escapeHtml(c)}</th>`).join('')
+  const body = rows
+    .slice(2)
+    .map((row) => `<tr>${cells(row).map((c) => `<td>${escapeHtml(c)}</td>`).join('')}</tr>`)
+    .join('')
+  return `<table><thead><tr>${head}</tr></thead><tbody>${body}</tbody></table>`
+}
+
 const markdownToHtml = (markdown: string): string => {
   const codeBlocks: string[] = []
   let text = markdown.replace(/```([\s\S]*?)```/g, (_, block) => {
@@ -87,13 +143,24 @@ const markdownToHtml = (markdown: string): string => {
     codeBlocks.push(`<pre><code>${escapeHtml(String(block).trim())}</code></pre>`)
     return `@@CODE_BLOCK_${index}@@`
   })
+  const tableBlocks: string[] = []
+  text = text.replace(/((?:^\|.*\n?)+)/gm, (block) => {
+    const rows = block.split('\n').map((r) => r.trim()).filter((r) => r.startsWith('|'))
+    const separatorRow = rows[1] ?? ''
+    if (rows.length < 2 || !/^\|?[\s:\-|]+\|?$/.test(separatorRow)) return block
+    const index = tableBlocks.length
+    tableBlocks.push(renderTable(rows))
+    return `@@TABLE_${index}@@`
+  })
   const lines = text.split('\n')
   const out: string[] = []
   let inList = false
+  let listType = ''
   const closeList = () => {
     if (inList) {
-      out.push('</ul>')
+      out.push(`</${listType}>`)
       inList = false
+      listType = ''
     }
   }
   for (const rawLine of lines) {
@@ -117,15 +184,36 @@ const markdownToHtml = (markdown: string): string => {
       out.push(`<h3>${escapeHtml(line.slice(4))}</h3>`)
       continue
     }
+    const orderedMatch = line.match(/^(\d+)\.\s+(.*)$/)
+    if (orderedMatch) {
+      if (listType !== 'ol') {
+        closeList()
+        out.push('<ol>')
+        inList = true
+        listType = 'ol'
+      }
+      out.push(`<li>${escapeHtml(orderedMatch[2] ?? '')}</li>`)
+      continue
+    }
     if (line.startsWith('- ') || line.startsWith('* ')) {
-      if (!inList) {
+      if (listType !== 'ul') {
+        closeList()
         out.push('<ul>')
         inList = true
+        listType = 'ul'
       }
       out.push(`<li>${escapeHtml(line.slice(2))}</li>`)
       continue
     }
     closeList()
+    if (line.startsWith('> ')) {
+      out.push(`<blockquote>${escapeHtml(line.slice(2))}</blockquote>`)
+      continue
+    }
+    if (/^(-{3,}|\*{3,})$/.test(line)) {
+      out.push('<hr />')
+      continue
+    }
     out.push(`<p>${escapeHtml(line)}</p>`)
   }
   closeList()
@@ -135,6 +223,7 @@ const markdownToHtml = (markdown: string): string => {
   html = html.replace(/`([^`]+)`/g, '<code>$1</code>')
   html = html.replace(/\[([^[\]]+)\]\((https?:\/\/[^)]+)\)/g, '<a href="$2" target="_blank" rel="noreferrer">$1</a>')
   html = html.replace(/@@CODE_BLOCK_(\d+)@@/g, (_, idx) => codeBlocks[Number(idx)] || '')
+  html = html.replace(/@@TABLE_(\d+)@@/g, (_, idx) => tableBlocks[Number(idx)] || '')
   return html
 }
 
@@ -157,6 +246,7 @@ const createNewChat = () => {
     },
   ]
   progressLogs.value = []
+  lastRunMeta.value = null
   errorMessage.value = ''
   query.value = ''
 }
@@ -191,6 +281,7 @@ const runResearch = async () => {
   loading.value = true
   errorMessage.value = ''
   progressLogs.value = []
+  lastRunMeta.value = null
   query.value = ''
   messages.value.push({ id: `u-${Date.now()}`, role: 'user', content: userText })
   const statusId = `s-${Date.now()}`
@@ -212,6 +303,7 @@ const runResearch = async () => {
         user_id: userId.value.trim() || 'default_user',
         thread_id: threadId.value.trim() || 'default_thread',
         tenant_id: tenantId.value.trim() || 'default_tenant',
+        research_domain: researchDomain.value,
       }),
     })
     if (!response.ok) {
@@ -241,12 +333,23 @@ const runResearch = async () => {
           renderStatusText()
         }
         if (event.type === 'final') {
+          lastRunMeta.value = {
+            calls: event.usage?.calls ?? 0,
+            cost_yuan: event.usage?.cost_yuan ?? 0,
+            quality: event.quality?.score,
+            report_id: event.report_id,
+            research_domain: event.research_domain,
+            evidence_count: event.evidence_summary?.evidence_count,
+            source_count: event.evidence_summary?.source_count,
+            trace: event.trace,
+          }
           messages.value = messages.value.filter((item) => item.id !== statusId)
           messages.value.push({
             id: `a-${Date.now()}`,
             role: 'assistant',
             content: event.final || '已完成，但未返回正文。',
           })
+          loadHistory()
         }
         if (event.type === 'error') {
           throw new Error(event.message || '服务端执行异常')
@@ -267,6 +370,85 @@ const runResearch = async () => {
     await scrollToBottom()
   }
 }
+
+const copyMessage = async (message: ChatMessage) => {
+  const text = message.content || ''
+  try {
+    await navigator.clipboard.writeText(text)
+  } catch {
+    const textarea = document.createElement('textarea')
+    textarea.value = text
+    textarea.style.position = 'fixed'
+    textarea.style.opacity = '0'
+    document.body.appendChild(textarea)
+    textarea.select()
+    document.execCommand('copy')
+    document.body.removeChild(textarea)
+  }
+}
+
+const downloadMessage = (message: ChatMessage) => {
+  const blob = new Blob([message.content || ''], { type: 'text/markdown;charset=utf-8' })
+  const url = URL.createObjectURL(blob)
+  const link = document.createElement('a')
+  link.href = url
+  link.download = `deepresearch-report-${new Date().toISOString().slice(0, 19).replace(/[:T]/g, '-')}.md`
+  document.body.appendChild(link)
+  link.click()
+  document.body.removeChild(link)
+  URL.revokeObjectURL(url)
+}
+
+const formatTime = (iso: string) => {
+  if (!iso) return ''
+  const d = new Date(iso)
+  const month = d.getMonth() + 1
+  const day = d.getDate()
+  const hour = String(d.getHours()).padStart(2, '0')
+  const minute = String(d.getMinutes()).padStart(2, '0')
+  return `${month}/${day} ${hour}:${minute}`
+}
+
+const loadHistory = async () => {
+  try {
+    const response = await fetch('/api/v1/research/history?limit=20')
+    if (!response.ok) return
+    const data = await response.json()
+    history.value = data.reports || []
+  } catch {
+    // 历史列表加载失败不影响主流程
+  }
+}
+
+const viewHistory = async (item: HistoryItem) => {
+  try {
+    const response = await fetch(`/api/v1/research/history/${item.id}`)
+    if (!response.ok) return
+    const report = await response.json()
+    lastRunMeta.value = {
+      calls: report.usage?.calls ?? 0,
+      cost_yuan: report.usage?.cost_yuan ?? 0,
+      quality: report.quality?.score,
+      report_id: report.id,
+      research_domain: report.research_domain,
+      evidence_count: report.evidence_summary?.evidence_count,
+      source_count: report.evidence_summary?.source_count,
+      trace: report.trace,
+    }
+    messages.value = [
+      { id: `h-${Date.now()}`, role: 'user', content: report.query || '历史报告' },
+      { id: `a-${Date.now()}`, role: 'assistant', content: report.final || '' },
+    ]
+    errorMessage.value = ''
+    await scrollToBottom()
+  } catch {
+    errorMessage.value = '历史报告加载失败'
+  }
+}
+
+onMounted(() => {
+  loadHistory()
+})
 </script>
 
 <template>
@@ -304,6 +486,20 @@ const runResearch = async () => {
         <input v-model="tenantId" class="sidebar-input" />
       </div>
       <p class="hint-text">当前会话记忆键：{{ userId }} / {{ threadId }}</p>
+      <div class="history-group">
+        <p class="section-title">历史报告</p>
+        <div v-if="history.length === 0" class="history-empty">暂无历史报告</div>
+        <button
+          v-for="item in history.slice(0, 10)"
+          :key="item.id"
+          class="history-item"
+          :title="item.query"
+          @click="viewHistory(item)"
+        >
+          <span class="history-query">{{ item.query }}</span>
+          <span class="history-time">{{ formatTime(item.created_at) }}</span>
+        </button>
+      </div>
     </aside>
 
     <main class="chat-main">
@@ -345,7 +541,7 @@ const runResearch = async () => {
           </div>
           <div class="guide-panel">
             <h4>提问指南</h4>
-            <div class=”guide-grid”>
+            <div class="guide-grid">
               <article>
                 <h5>1. 指定标的</h5>
                 <p>输入股票代码或公司名称，例如「002594 比亚迪」或「宁德时代」。</p>
@@ -374,9 +570,36 @@ const runResearch = async () => {
         >
           <div class="avatar">{{ message.role === 'user' ? '你' : message.role === 'status' ? '...' : 'AI' }}</div>
           <div class="bubble markdown-body" v-html="renderMessageHtml(message)"></div>
+          <button
+            v-if="message.role === 'assistant'"
+            class="copy-btn"
+            title="复制报告 Markdown"
+            @click="copyMessage(message)"
+          >
+            复制
+          </button>
+          <button
+            v-if="message.role === 'assistant'"
+            class="copy-btn"
+            title="下载报告 Markdown"
+            @click="downloadMessage(message)"
+          >
+            下载
+          </button>
         </div>
       </div>
+      <p v-if="lastRunMeta" class="run-meta">
+        本次研究：{{ lastRunMeta.calls }} 次 LLM 调用，约 ¥{{ lastRunMeta.cost_yuan.toFixed(4) }}
+        <template v-if="lastRunMeta.quality !== undefined"> ｜ 质量自检 {{ lastRunMeta.quality }}/100</template>
+        <template v-if="lastRunMeta.research_domain"> ｜ 研究域 {{ lastRunMeta.research_domain }}</template>
+        <template v-if="lastRunMeta.evidence_count !== undefined"> ｜ 证据 {{ lastRunMeta.evidence_count }} 条</template>
+      </p>
       <div class="composer">
+        <select v-model="researchDomain" class="domain-select" :disabled="loading" title="选择研究域">
+          <option value="auto">自动识别</option>
+          <option value="general">企业/技术研究</option>
+          <option value="finance">金融投研</option>
+        </select>
         <textarea
           v-model="query"
           ref="composerRef"

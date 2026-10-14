@@ -1,6 +1,7 @@
 """工作流编排模块：定义 LangGraph 节点、条件路由与整体执行路径。"""
 
 import logging
+import os
 
 from langgraph.graph import StateGraph, START, END
 
@@ -15,6 +16,7 @@ from .nodes import (
     analyze_node,
     reflect_node,
     write_node,
+    judge_node,
 )
 from .state import ResearchState
 
@@ -44,6 +46,12 @@ def should_continue_research(state: ResearchState) -> str:
     return "write"
 
 
+def route_after_write(state: ResearchState) -> str:
+    """写作完成后：启用 LLM_AS_JUDGE 时先评审，否则直接结束。"""
+    use_llm_judge = os.getenv("LLM_AS_JUDGE", "").strip().lower() in {"1", "true", "yes"}
+    return "judge" if use_llm_judge else "end"
+
+
 def build_app(agents, checkpointer):
     workflow = StateGraph(ResearchState)
     workflow.add_node("intent", bind_agent(intent_node, agents.intent_router, "intent_router"))
@@ -55,6 +63,7 @@ def build_app(agents, checkpointer):
     workflow.add_node("analyze", bind_agent(analyze_node, agents.analyst, "analyst"))
     workflow.add_node("reflect", bind_agent(reflect_node, agents.reflect_planner, "reflect_planner"))
     workflow.add_node("write", bind_agent(write_node, agents.writer, "writer"))
+    workflow.add_node("judge", bind_agent(judge_node, agents.judge, "judge"))
     
     workflow.add_edge(START, "intent")
     workflow.add_conditional_edges(
@@ -83,6 +92,14 @@ def build_app(agents, checkpointer):
     workflow.add_edge("reflect", "web_search")
     workflow.add_edge("reflect", "local_rag")
     workflow.add_edge("direct_answer", END)
-    workflow.add_edge("write", END)
+    workflow.add_conditional_edges(
+        "write",
+        route_after_write,
+        {
+            "judge": "judge",
+            "end": END,
+        },
+    )
+    workflow.add_edge("judge", END)
     
     return workflow.compile(checkpointer=checkpointer)

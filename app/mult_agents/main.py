@@ -24,9 +24,11 @@ from .prompts import PROMPTS
 from .state import create_initial_state
 from .tools import (
     init_rag_system,
+    register_rag_config,
 )
 from .rag.core import RAGConfig
 from .llm_factory import build_chat_model
+from .usage import aggregate_usage
 
 
 logger = logging.getLogger("mult_agents")
@@ -164,15 +166,18 @@ def parse_cli_args() -> argparse.Namespace:
     parser.add_argument("--enable-milvus", choices=["true", "false"], default=None)
     parser.add_argument("--memory-top-k", type=int, default=None)
     parser.add_argument("--once-query", type=str, default=None)
+    parser.add_argument("--max-iterations", type=int, default=None)
+    parser.add_argument("--json", action="store_true", help="以 JSON 输出结果（配合 --once-query）")
     return parser.parse_args()
 
 
 def build_runtime_config(args: argparse.Namespace) -> AppConfig:
-    config = AppConfig.from_file(args.config) if args.config else AppConfig.from_file()
+    config = AppConfig.load(args.config)
     overrides = {
         "tenant_id": args.tenant_id,
         "user_id": args.user_id,
         "thread_id": args.thread_id,
+        "max_iterations": args.max_iterations,
         "short_term_backend": args.short_term_backend,
         "long_term_backend": args.long_term_backend,
         "long_term_scope": args.long_term_scope,
@@ -213,11 +218,31 @@ class AgentBundle:
     reflect_planner: any
     direct_responder: any
     writer: any
+    judge: any
 
 
-def build_agent(model: str, api_key: str, base_url: str, prompt_key: str, temperature: float, tools: list):
-    llm = build_chat_model(model=model, api_key=api_key, base_url=base_url, temperature=temperature)
-    prompt = PROMPTS[prompt_key]
+def build_agent(
+    model: str,
+    api_key: str,
+    base_url: str,
+    prompt_key: str,
+    temperature: float,
+    tools: list,
+    max_tokens: int = 4096,
+):
+    llm = build_chat_model(
+        model=model,
+        api_key=api_key,
+        base_url=base_url,
+        temperature=temperature,
+        max_tokens=max_tokens,
+    )
+    prompt = PROMPTS[prompt_key] + (
+        "\n\n【运行时研究域规则】\n"
+        "用户请求会在输入中声明 research_domain。若为 general enterprise research，"
+        "必须按问题动态设计章节和结论，不得强行输出投资评级、目标价或金融五维模板；"
+        "若为 finance，才使用金融投研框架。无论研究域是什么，都必须尊重来源、引用和证据约束。"
+    )
     return create_agent(model=llm, tools=tools, system_prompt=prompt)
 
 
@@ -231,21 +256,29 @@ def build_agents(model: str, api_key: str, base_url: str, config: AppConfig) -> 
         embedding_model=config.embedding_model,
         embedding_base_url=config.embedding_base_url,
     )
-    init_rag_system(config=rag_config)
+    # 注册 RAG 配置以便按需懒加载；仅在启用 Milvus 时才真正初始化
+    # （否则默认会加载本地 BGE 嵌入模型并尝试连接 Milvus，拖慢启动）
+    register_rag_config(rag_config)
+    if config.enable_milvus:
+        init_rag_system(config=rag_config)
     return AgentBundle(
-        intent_router=build_agent(model, api_key, base_url, "intent_router", 0.0, []),
-        planner=build_agent(model, api_key, base_url, "plan", 0.3, []),
-        scout_web=build_agent(model, api_key, base_url, "web_search", 0.4, []),
-        scout_local=build_agent(model, api_key, base_url, "local_rag", 0.4, []),
-        evidence_judge=build_agent(model, api_key, base_url, "deep_dive", 0.2, []),
-        analyst=build_agent(model, api_key, base_url, "analyze", 0.3, []),
-        reflect_planner=build_agent(model, api_key, base_url, "reflect", 0.3, []),
-        direct_responder=build_agent(model, api_key, base_url, "direct_answer", 0.2, []),
-        writer=build_agent(model, api_key, base_url, "write", 0.4, []),
+        # JSON 类节点输出有限，降低 max_tokens 可显著减少生成耗时
+        intent_router=build_agent(model, api_key, base_url, "intent_router", 0.0, [], max_tokens=1024),
+        planner=build_agent(model, api_key, base_url, "plan", 0.3, [], max_tokens=2048),
+        scout_web=build_agent(model, api_key, base_url, "web_search", 0.4, [], max_tokens=2048),
+        scout_local=build_agent(model, api_key, base_url, "local_rag", 0.4, [], max_tokens=2048),
+        evidence_judge=build_agent(model, api_key, base_url, "deep_dive", 0.2, [], max_tokens=1024),
+        analyst=build_agent(model, api_key, base_url, "analyze", 0.3, [], max_tokens=2048),
+        reflect_planner=build_agent(model, api_key, base_url, "reflect", 0.3, [], max_tokens=1024),
+        direct_responder=build_agent(model, api_key, base_url, "direct_answer", 0.2, [], max_tokens=1024),
+        # 写作需要长输出，保留大上限
+        writer=build_agent(model, api_key, base_url, "write", 0.4, [], max_tokens=4096),
+        # LLM-as-Judge：可选质量评审（LLM_AS_JUDGE=true 时启用）
+        judge=build_agent(model, api_key, base_url, "judge", 0.2, [], max_tokens=1024),
     )
 
 
-def run_query(app, config: AppConfig, query: str):
+def run_query(app, config: AppConfig, query: str) -> tuple[str, dict, dict]:
     memory_context = ""
     if MEMORY_MANAGER:
         try:
@@ -270,6 +303,8 @@ def run_query(app, config: AppConfig, query: str):
         {"configurable": {"thread_id": config.thread_id}},
     )
     final = result["final"]
+    usage = aggregate_usage(result.get("usage_log", []))
+    quality = result.get("quality_report", {})
     if MEMORY_MANAGER:
         try:
             MEMORY_MANAGER.persist_turn(
@@ -281,7 +316,7 @@ def run_query(app, config: AppConfig, query: str):
             )
         except Exception as exc:
             logger.warning("%s 持久化记忆失败，已跳过: %s", colorize("[memory]", "yellow"), exc)
-    return final
+    return final, usage, quality
 
 
 def read_user_input(prompt: str = "你: ") -> str:
@@ -312,8 +347,11 @@ def main():
     checkpointer = build_checkpointer(config)
     app = build_workflow_app(agents, checkpointer)
     if args.once_query:
-        response = run_query(app, config, args.once_query)
-        print(f"\nAI: {response}\n")
+        response, usage, quality = run_query(app, config, args.once_query)
+        if args.json:
+            print(json.dumps({"final": response, "usage": usage, "quality": quality}, ensure_ascii=False, indent=2))
+        else:
+            print(f"\nAI: {response}\n")
     else:
         while True:
             try:
@@ -330,7 +368,7 @@ def main():
             if query.lower() in {"/memory-trace", "memory-trace"} and MEMORY_MANAGER:
                 print(json.dumps(MEMORY_MANAGER.get_last_trace(), ensure_ascii=False, indent=2))
                 continue
-            response = run_query(app, config, query)
+            response, _, _ = run_query(app, config, query)
             print(f"\nAI: {response}\n")
     if CHECKPOINTER_CONTEXT:
         CHECKPOINTER_CONTEXT.__exit__(None, None, None)

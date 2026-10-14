@@ -1,15 +1,13 @@
-version: "3.8"
-
 services:
   # ═══════════════════════════════════════════════════════
   # 基础设施
   # ═══════════════════════════════════════════════════════
 
   redis:
-    image: redis/redis-stack:latest
+    image: redis:7.4-alpine
     container_name: dr-redis
-    ports:
-      - "6379:6379"
+    expose:
+      - "6379"
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
@@ -20,11 +18,12 @@ services:
   postgres:
     image: postgres:16
     container_name: dr-postgres
-    ports:
-      - "5432:5432"
+    expose:
+      - "5432"
     environment:
-      POSTGRES_PASSWORD: postgres
-      POSTGRES_DB: deep_research
+      POSTGRES_USER: ${POSTGRES_USER:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set in .env}
+      POSTGRES_DB: ${POSTGRES_DB:-deep_research}
     volumes:
       - pgdata:/var/lib/postgresql/data
     restart: unless-stopped
@@ -37,10 +36,15 @@ services:
   milvus:
     image: milvusdb/milvus:v2.4.0
     container_name: dr-milvus
+    command: ["milvus", "run", "standalone"]
     ports:
       - "19530:19530"
       - "9091:9091"
     environment:
+      ETCD_USE_EMBED: "true"
+      ETCD_DATA_DIR: /var/lib/milvus/etcd
+      # 本地存储模式：不依赖 MinIO，数据落在 /var/lib/milvus（milvus_data 卷）
+      COMMON_STORAGETYPE: "local"
       MILVUS_CONFIG_CPU_CACHE_CAPACITY: 2
     volumes:
       - milvus_data:/var/lib/milvus
@@ -50,7 +54,7 @@ services:
       interval: 10s
       timeout: 5s
       retries: 10
-      start_period: 30s
+      start_period: 60s
 
   # ═══════════════════════════════════════════════════════
   # 应用服务
@@ -62,13 +66,14 @@ services:
       dockerfile: Dockerfile.backend
     container_name: dr-backend
     ports:
-      - "8000:8000"
+      - "127.0.0.1:8000:8000"
     environment:
       - DEEPSEEK_API_KEY=${DEEPSEEK_API_KEY}
       - BOCHA_API_KEY=${BOCHA_API_KEY:-}
+      - AUTH_TOKEN=${AUTH_TOKEN:-}
       - MAX_ITERATIONS=2
       - REDIS_URL=redis://redis:6379
-      - POSTGRES_DSN=postgresql://postgres:postgres@postgres:5432/deep_research
+      - POSTGRES_DSN=postgresql://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-deep_research}?sslmode=disable
       - MILVUS_HOST=milvus
       - MILVUS_PORT=19530
       - CHECKPOINTER_BACKEND=redis
@@ -77,6 +82,7 @@ services:
       - SHORT_TERM_BACKEND=postgres
       - LONG_TERM_BACKEND=postgres
       - EMBEDDING_PROVIDER=huggingface
+      - EMBEDDING_MODEL=BAAI/bge-small-zh-v1.5
     depends_on:
       redis:
         condition: service_healthy
@@ -85,6 +91,12 @@ services:
       milvus:
         condition: service_healthy
     restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request;urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=3)"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
     volumes:
       - ./knowledge_base:/app/knowledge_base
 
@@ -94,11 +106,10 @@ services:
       dockerfile: Dockerfile.frontend
     container_name: dr-frontend
     ports:
-      - "5173:5173"
-    environment:
-      - VITE_API_BASE_URL=http://backend:8000
+      - "127.0.0.1:5173:80"
     depends_on:
-      - backend
+      backend:
+        condition: service_healthy
     restart: unless-stopped
 
 volumes:

@@ -16,6 +16,7 @@ def build_chat_model(
     api_key: str = "",
     base_url: str = "https://api.deepseek.com/v1",
     temperature: float = 0.3,
+    max_tokens: int = 4096,
 ):
     """创建 DeepSeek Chat 模型实例（OpenAI 兼容协议）。
 
@@ -31,7 +32,7 @@ def build_chat_model(
         temperature=temperature,
         openai_api_key=api_key or None,
         openai_api_base=base_url.rstrip("/") if base_url else "https://api.deepseek.com/v1",
-        max_tokens=4096,
+        max_tokens=max_tokens,
         timeout=45,
         max_retries=1,
     )
@@ -48,6 +49,7 @@ def build_summary_llm(
         api_key=api_key,
         base_url=base_url,
         temperature=0.1,
+        max_tokens=1024,
     )
 
 

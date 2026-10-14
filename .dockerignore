@@ -1,0 +1,32 @@
+# 密钥与本地配置：绝不进入镜像
+.env
+.env.*
+!.env.example
+config.json
+
+# 版本控制与 IDE
+.git
+.gitignore
+.github
+.vscode
+.idea
+.claude
+
+# Python 产物
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+app/data/
+*.db
+
+# 前端产物
+front/agent_front/node_modules/
+front/agent_front/dist/
+
+# 运行时数据与日志
+knowledge_base/
+*.log
+release/
+dist/

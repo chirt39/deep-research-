@@ -1,0 +1,3 @@
+{"case_id":"general-rag-001","research_domain":"general","query":"比较 FastAPI 和 Flask 在企业 API 服务中的适用场景","must_contain":["FastAPI","Flask"],"must_have_citation":true}
+{"case_id":"general-rag-002","research_domain":"general","query":"调研 LangGraph 的状态持久化和断点恢复机制","must_contain":["LangGraph"],"must_have_citation":true}
+{"case_id":"finance-001","research_domain":"finance","query":"分析比亚迪的估值、现金流和主要风险","must_contain":["估值","风险"],"must_have_citation":true}

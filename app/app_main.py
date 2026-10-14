@@ -1,6 +1,8 @@
 import logging
+import time
+import uuid
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 import uvicorn
 
@@ -26,6 +28,25 @@ def create_app() -> FastAPI:
         allow_methods=["*"],
         allow_headers=["*"],
     )
+
+    @app.middleware("http")
+    async def request_logging(request: Request, call_next):
+        """请求日志：记录耗时并透传/生成 request_id，便于排查一次完整调用。"""
+        request_id = request.headers.get("x-request-id") or uuid.uuid4().hex[:12]
+        start = time.perf_counter()
+        response = await call_next(request)
+        duration_ms = (time.perf_counter() - start) * 1000
+        logger.info(
+            "request_id=%s method=%s path=%s status=%s duration_ms=%.0f",
+            request_id,
+            request.method,
+            request.url.path,
+            response.status_code,
+            duration_ms,
+        )
+        response.headers["x-request-id"] = request_id
+        return response
+
     app.include_router(health_router)
     app.include_router(research_router)
     return app
