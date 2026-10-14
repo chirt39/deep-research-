@@ -92,16 +92,16 @@ const starterPrompts = [
 ]
 const capabilityHighlights = [
   {
-    title: '五维分析框架',
-    desc: '宏观→行业→公司→估值→舆情，五层递进，每个结论绑定可追溯来源。',
+    title: '动态研究框架',
+    desc: '根据企业、技术或金融问题动态设计章节，避免所有问题套用同一模板。',
   },
   {
-    title: '金融信源分层',
-    desc: '官方公告>持牌机构研报>头部财经媒体>数据平台>自媒体，自动打分去重。',
+    title: '多源证据分层',
+    desc: '融合网页、本地知识库和结构化数据，对来源进行分层、去重和可信度检查。',
   },
   {
-    title: '多维估值模型',
-    desc: '相对估值（PE/PB/PS/PEG）+ 绝对估值（DCF），同业对比与历史分位交叉验证。',
+    title: '迭代式质量检查',
+    desc: '发现证据不足时触发反思和补充检索，写作后再检查引用、结构和结论覆盖。',
   },
 ]
 const landingMetrics = [
@@ -113,7 +113,7 @@ const messages = ref<ChatMessage[]>([
   {
     id: `m-${Date.now()}`,
     role: 'assistant',
-      content: '你好，我是 DeepResearch 金融投研助手。输入股票代码或研究问题，我会自动执行宏观研判→行业分析→公司深度→估值模型→舆情跟踪的全链路分析，输出专业投研报告。',
+      content: '你好，我是 DeepResearch 研究助手。你可以输入企业/技术调研问题，也可以输入金融研究问题；系统会根据研究域执行检索、证据判断、分析、反思和报告生成。',
   },
 ])
 
@@ -242,7 +242,7 @@ const createNewChat = () => {
     {
       id: `m-${Date.now()}`,
       role: 'assistant',
-      content: '已开始新会话。输入股票代码或研究问题即可开始分析。',
+      content: '已开始新会话。输入企业、技术或金融研究问题即可开始分析。',
     },
   ]
   progressLogs.value = []
@@ -455,9 +455,9 @@ onMounted(() => {
   <div class="chat-shell">
     <aside class="chat-sidebar">
       <div class="sidebar-brand">
-        <p class="brand-badge">FinResearch</p>
+        <p class="brand-badge">AI Research</p>
         <h1>DeepResearch</h1>
-        <p class="brand-desc">金融多智能体深度投研平台，覆盖宏观·行业·公司·估值·舆情五维分析。</p>
+        <p class="brand-desc">企业知识库与网络研究融合的多智能体平台，支持技术调研和金融投研。</p>
       </div>
       <div class="sidebar-head">
         <button class="new-chat-btn" @click="createNewChat">新建会话</button>
@@ -505,11 +505,11 @@ onMounted(() => {
     <main class="chat-main">
       <header class="main-header">
         <div>
-          <h2>DeepResearch 金融投研工作台</h2>
-          <p>面向投资研究团队的专业级智能分析平台，从问题定义到专业研报输出的全链路自动化。</p>
+          <h2>DeepResearch AI 研究工作台</h2>
+          <p>从问题定义、证据检索到报告质检的全链路研究平台，支持企业/技术研究与金融投研。</p>
         </div>
         <div class="header-tags">
-          <span>五维分析框架</span>
+          <span>研究域自适应</span>
           <span>信源交叉验证</span>
           <span>券商级研报</span>
         </div>
@@ -517,10 +517,10 @@ onMounted(() => {
       <div ref="messageListRef" class="message-list">
         <section v-if="messages.length <= 1" class="onboarding-panel">
           <div class="hero-panel">
-            <p class="hero-badge">宏观研判 · 行业分析 · 公司深度 · 估值模型 · 舆情跟踪</p>
-            <h3>输入股票代码或研究问题，自动生成专业投研报告</h3>
+            <p class="hero-badge">问题拆解 · 多源检索 · 证据判断 · 反思补搜 · 报告质检</p>
+            <h3>输入研究问题，自动生成带证据的研究报告</h3>
             <p class="hero-desc">
-              推荐提问结构：标的 + 分析维度 + 时间范围。系统自动执行宏观/行业/公司/估值/舆情五维分析。
+              推荐提问结构：研究对象 + 分析维度 + 时间范围。系统会根据研究域选择检索工具并展示证据摘要。
             </p>
             <div class="hero-actions">
               <button class="hero-btn primary" @click="applyStarterByIndex(0)">个股深度研究</button>
@@ -543,12 +543,12 @@ onMounted(() => {
             <h4>提问指南</h4>
             <div class="guide-grid">
               <article>
-                <h5>1. 指定标的</h5>
-                <p>输入股票代码或公司名称，例如「002594 比亚迪」或「宁德时代」。</p>
+                <h5>1. 指定对象</h5>
+                <p>输入公司、产品、技术或行业，例如「比亚迪 002594」或「LangGraph 状态持久化」。</p>
               </article>
               <article>
                 <h5>2. 明确维度</h5>
-                <p>选择关注的分析维度：财务健康度 / 估值水平 / 行业竞争 / 宏观影响 / 机构评级。</p>
+                <p>说明想比较、验证或解决的问题，例如技术选型、竞争格局、成本、风险或实施方案。</p>
               </article>
               <article>
                 <h5>3. 限定范围</h5>
